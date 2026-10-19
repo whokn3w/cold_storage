@@ -1,0 +1,30 @@
+services:
+  cold_storage:
+    image: ghcr.io/whokn3w/cold_storage:0.4.2
+    container_name: cold_storage
+    restart: unless-stopped
+
+    ports:
+      - "8787:8080"
+
+    environment:
+      DB_PATH: /config/cold_storage.db
+      DEVICES_PATH: /records/devices
+      BACKUPS_PATH: /backups
+      TZ: ${TZ:-America/Detroit}
+
+    volumes:
+      - ./data/config:/config:rw
+      - ./data/records:/records:ro
+      - ./data/backups:/backups:rw
+
+    security_opt:
+      - no-new-privileges:true
+
+    cap_drop:
+      - ALL
+
+    read_only: true
+
+    tmpfs:
+      - /tmp:size=32m
