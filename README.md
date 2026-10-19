@@ -77,3 +77,15 @@ Never delete these directories during a container upgrade.
 ## Version
 
 v0.4.2
+
+## v0.5.0 development: storage snapshot safeguards
+
+Refresh Catalog attempts a low-impact `statvfs` measurement only when the
+registered model/serial, mounted filesystem, kernel major:minor device identity,
+and a unique matching `ata-...-partN` persistent hardware identifier agree.
+The current `/dev/sdX` partition name is discovered at refresh time, never
+persisted as an identity. A disconnected or mismatched disk retains its last
+snapshot. This feature requires read-only `/mnt/disks` and `/dev/disk/by-id`
+mounts and access to `/sys/dev/block` inside the container. No raw block devices
+are opened, no file contents are scanned, and no disks are mounted automatically.
+Test this in an isolated container/database before using in production.
