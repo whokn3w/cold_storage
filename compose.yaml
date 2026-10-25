@@ -1,6 +1,6 @@
 services:
   cold_storage:
-    image: ghcr.io/whokn3w/cold_storage:0.4.2
+    image: ghcr.io/whokn3w/cold_storage:0.6.0
     container_name: cold_storage
     restart: unless-stopped
 

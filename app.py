@@ -7,7 +7,7 @@ DB = os.getenv('DB_PATH', '/config/cold_storage.db')
 DEVICES = pathlib.Path(os.getenv('DEVICES_PATH', '/records/devices'))
 BACKUPS = pathlib.Path(os.getenv('BACKUPS_PATH', '/backups'))
 PORT = int(os.getenv('PORT', '8080'))
-APP_VERSION = '0.5.0-dev'
+APP_VERSION = '0.6.0'
 LOCK = threading.Lock()
 UTC = datetime.timezone.utc
 LOCAL_TZ = ZoneInfo(os.environ.get("TZ", "America/Detroit"))
@@ -96,7 +96,18 @@ def refresh():
             ident=data['device_id']
             if ident!=folder.name: raise ValueError('Device ID does not match directory')
             manifest=folder/'manifests'/'baseline.sha256'
-            files=parse_manifest(manifest) if manifest.is_file() else []
+            if manifest.is_symlink():
+                raise ValueError("SHA-256 manifest is a symbolic link")
+            if manifest.is_file():
+                files=parse_manifest(manifest)
+            elif manifest.exists():
+                raise ValueError(
+                    "SHA-256 manifest is not a regular file"
+                )
+            else:
+                # Registered-only drive or unavailable manifest.
+                # Never interpret absence as an empty file list.
+                files=None
             runs=read_runs(folder/'verification_logs'/'runs.tsv')
             issues=read_issues(folder/'verification_logs'/'issues.tsv')
             parsed.append((data,files,runs,issues))
@@ -109,6 +120,31 @@ def refresh():
                 db.execute('BEGIN IMMEDIATE')
                 for data,files,runs,issues in parsed:
                     ident=data['device_id']
+
+                    if files is None:
+                        # Insert newly registered drives as metadata-only.
+                        # Existing records are never replaced or cleared.
+                        db.execute(
+                            'INSERT OR IGNORE INTO drives '
+                            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                            (
+                                ident,
+                                data.get('model'),
+                                data.get('serial'),
+                                data.get('capacity_bytes'),
+                                data.get('registered_at'),
+                                data.get(
+                                    'verification_interval_days',180
+                                ),
+                                0,None,None,None,0,None
+                            )
+                        )
+                        storage_messages.append(
+                            f"{ident}: SHA-256 manifest not initialized "
+                            "or unavailable; existing records preserved."
+                        )
+                        continue
+
                     ver=[r for r in runs if r[1]=='verify']
                     last_ver=ver[-1] if ver else None
                     passed=[r for r in ver if r[2]=='PASS']
@@ -270,7 +306,211 @@ CSS='''<style>body{margin:0;background:#f4f6f9;color:#17243a;font:15px system-ui
 :root[data-theme="dark"]{color-scheme:dark;--bg:#111923;--fg:#e9f0f8;--surface:#1c2938;--border:#34485c;--subtle:#a8b9ca;--accent:#78b9f7;--header:#101d2b;--track:#35475a;--headtext:#bbcbdb}
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#111923;--fg:#e9f0f8;--surface:#1c2938;--border:#34485c;--subtle:#a8b9ca;--accent:#78b9f7;--header:#101d2b;--track:#35475a;--headtext:#bbcbdb}}
 body{background:var(--bg);color:var(--fg)}header{background:var(--header)}a{color:var(--accent)}nav a,.panel,.metric{background:var(--surface);border-color:var(--border)}.muted,footer{color:var(--subtle)}th,.drive-tag{color:var(--headtext)}th,td{border-color:var(--border)}input,select{background:var(--surface);color:var(--fg);border:1px solid var(--border)}.theme-control{margin-left:auto;display:flex;align-items:center;gap:8px;color:#dce9f7}.theme-control select{padding:7px;border-radius:7px;min-width:95px}.brand{flex-wrap:wrap}.storage-stats{margin-top:16px}.storage-card{border:1px solid var(--border);background:var(--surface);border-radius:10px;padding:16px;margin:12px 0}.storage-card h3{margin:0 0 6px;font-size:16px;overflow-wrap:anywhere}.storage-bar{height:11px;border-radius:99px;background:var(--track);overflow:hidden;margin:10px 0}.storage-fill{height:100%;background:#238c9b}.storage-meta{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}.storage-note{font-size:13px;color:var(--subtle)}.metric b{overflow-wrap:anywhere}.metric small{display:block;color:var(--subtle);margin-top:6px}footer{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}button{background:#1766b2}button:hover{filter:brightness(1.08)}
+
+.drive-tools{margin-top:20px;padding-top:14px;border-top:1px solid var(--border)}
+.drive-tools summary{cursor:pointer;color:var(--accent);font-weight:600;padding:8px 0}
+.drive-tools .panel{margin:14px 0}
+.drive-tools h3{font-size:16px}
+
+/* cold_storage 0.6.0 dark-theme refinement */
+
+/* Explicit dark theme */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #101214;
+  --fg: #e8ecef;
+  --surface: #1c2024;
+  --border: #383e45;
+  --subtle: #aeb7c0;
+  --accent: #8bc5f7;
+  --header: #171b1f;
+  --track: #333a42;
+  --headtext: #c0c8cf;
+}
+
+:root[data-theme="dark"] .good {
+  color: #72dca3;
+}
+
+:root[data-theme="dark"] .warn {
+  color: #f2bd6b;
+}
+
+:root[data-theme="dark"] .bad {
+  color: #ff808e;
+}
+
+/* System theme when operating system prefers dark */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #101214;
+    --fg: #e8ecef;
+    --surface: #1c2024;
+    --border: #383e45;
+    --subtle: #aeb7c0;
+    --accent: #8bc5f7;
+    --header: #171b1f;
+    --track: #333a42;
+    --headtext: #c0c8cf;
+  }
+
+  :root:not([data-theme="light"]) .good {
+    color: #72dca3;
+  }
+
+  :root:not([data-theme="light"]) .warn {
+    color: #f2bd6b;
+  }
+
+  :root:not([data-theme="light"]) .bad {
+    color: #ff808e;
+  }
+}
+
+
+.storage-attention{
+  margin-top:12px;
+  padding-top:10px;
+  border-top:1px solid var(--border);
+  font-size:13px;
+  overflow-wrap:anywhere;
+}
+
+/* Compact archive drive details — 0.6.0 */
+.drive-facts{
+  display:grid;
+  grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+  gap:12px;
+  margin:18px 0;
+}
+.drive-facts>div{
+  padding:13px;
+  background:var(--surface);
+  border:1px solid var(--border);
+  border-radius:8px;
+}
+.drive-facts small{
+  display:block;
+  color:var(--subtle);
+  margin-bottom:7px;
+}
+.drive-facts strong{
+  display:block;
+  font-size:15px;
+  overflow-wrap:anywhere;
+}
+.drive-history details{
+  padding:14px 0;
+  border-bottom:1px solid var(--border);
+}
+.drive-history details:last-child{border-bottom:0}
+.drive-history summary{
+  cursor:pointer;
+  font-weight:600;
+}
+.drive-table{overflow-x:auto;margin-top:14px}
+
+.verify-command-tool{
+  margin-top:20px;
+  padding-top:14px;
+  border-top:1px solid var(--border);
+}
+.verify-command-tool h3{
+  font-size:16px;
+  margin:4px 0 10px;
+}
+.verify-command-tool input{
+  width:min(650px,95%);
+  box-sizing:border-box;
+  font-family:monospace;
+  font-size:13px;
+}
+.verify-command-tool button{
+  margin-top:6px;
+}
+
+.register-command-tool{
+  margin-top:16px;
+  padding-top:14px;
+  border-top:1px solid var(--border);
+}
+.register-command-tool h4{
+  margin:0 0 10px;
+  font-size:15px;
+}
+
+/* compact SHA-256 checksum controls — 0.6.0 */
+.checksum-actions{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:12px;
+}
+.checksum-action{
+  display:flex;
+  flex-direction:column;
+  gap:9px;
+  min-width:0;
+  padding:14px;
+  border:1px solid var(--border);
+  border-radius:9px;
+}
+.checksum-action strong{
+  font-size:14px;
+}
+.checksum-action p{
+  margin:0;
+  font-size:13px;
+}
+.verify-command-tool .checksum-intro{
+  margin:0 0 13px;
+  font-size:13px;
+}
+.checksum-action input{
+  width:100%;
+  box-sizing:border-box;
+  font-size:12px;
+}
+.checksum-action button{
+  width:100%;
+  margin-top:auto;
+  font-size:13px;
+}
+.checksum-action [role="status"]{
+  font-size:12px;
+}
+@media(max-width:650px){
+  .checksum-actions{
+    grid-template-columns:1fr;
+  }
+}
+
+.catalog-action-buttons{
+    display:flex;
+    gap:12px;
+    align-items:center;
+    flex-wrap:wrap;
+}
+.catalog-action-buttons form{
+    margin:0;
+}
 </style>'''
+
+def drive_brand(model):
+    """Infer manufacturer from saved model text only."""
+    value = (model or "").strip().upper()
+
+    if value.startswith(("WDC ", "WESTERN DIGITAL ")):
+        return "Western Digital"
+    if value.startswith("SEAGATE "):
+        return "Seagate"
+    if value.startswith("TOSHIBA "):
+        return "Toshiba"
+    if value.startswith("HGST "):
+        return "HGST"
+
+    return "Unknown"
+
 
 def disk_icon():
     return ('<span class="driveicon" aria-label="Hard drive"><svg viewBox="0 0 24 24" fill="none" '
@@ -293,9 +533,10 @@ def storage_overview(db, drives):
     available=sum(x['available_bytes'] for _,x in known)
     complete=len(known)==len(drives) and bool(drives)
     scope='All registered drives' if complete else f'{len(known)} of {len(drives)} drives with snapshots'
-    body='<section class="panel"><h2>Archive Storage Overview</h2><p class="muted">Capacity is based on registered drive metadata. Usage is based on the latest recorded snapshots, not live disk scans.</p>'
+    body='<section class="panel"><h2>Archive Storage Overview</h2>'
     body+='<div class="grid storage-stats">'
-    body+=f'<div class="metric">Total registered capacity<b>{human_bytes(total_capacity)}</b><small>{len(drives)} registered drive(s)</small></div>'
+    body+=f'<div class="metric">Registered drives<b>{len(drives)}</b><small>Physical archive drives in the catalog</small></div>'
+    body+=f'<div class="metric">Total registered capacity<b>{human_bytes(total_capacity)}</b><small>Across registered drives</small></div>'
     body+=f'<div class="metric">Recorded used<b>{human_bytes(used) if known else "—"}</b><small>{esc(scope)}</small></div>'
     body+=f'<div class="metric">Recorded available<b>{human_bytes(available) if known else "—"}</b><small>{esc(scope)}</small></div></div>'
     if not complete: body+='<p class="storage-note">Usage totals are incomplete; drives without snapshots are excluded. Available space is not estimated from capacity alone.</p>'
@@ -304,16 +545,504 @@ def storage_overview(db, drives):
         valid=bool(snap and cap is not None and cap>0 and 0<=snap['used_bytes']<=cap and 0<=snap['available_bytes']<=cap)
         body+='<div class="storage-card">'
         body+=f'<h3><a href="/drive?id={urllib.parse.quote(ident)}">{disk_icon()}{esc(r["model"] or ident)}</a></h3>'
-        body+=f'<div class="storage-note">Serial: {esc(r["serial"] or "Unknown")} · <a href="/files?drive={urllib.parse.quote(ident)}">Browse files →</a></div>'
+        body+=f'<div class="storage-note">Brand: {esc(drive_brand(r["model"]))} · Serial: {esc(r["serial"] or "Unknown")} · <a href="/files?drive={urllib.parse.quote(ident)}">Browse files →</a></div>'
         body+=f'<div class="storage-meta"><span>Capacity: <b>{human_bytes(cap)}</b></span><span>{"Used: "+human_bytes(snap["used_bytes"]) if valid else "Usage unavailable"}</span></div>'
         if valid:
             pct=100*snap['used_bytes']/cap
             body+=f'<div class="storage-bar" role="progressbar" aria-label="Recorded used capacity" aria-valuenow="{pct:.1f}" aria-valuemin="0" aria-valuemax="100"><div class="storage-fill" style="width:{pct:.2f}%"></div></div>'
             body+=f'<div class="storage-note">{pct:.1f}% recorded used · {human_bytes(snap["available_bytes"])} recorded available · Snapshot: {esc(when(snap["captured_at"]))}</div>'
         else:body+='<div class="storage-bar" aria-label="Usage unavailable"></div><div class="storage-note">Storage snapshot not yet recorded</div>'
+
+        # Use the same recorded integrity statuses as the drive page.
+        # No hashing, verification or repair is initiated here.
+        sha_status, _, _ = drive_sha256_status(db, r)
+        par2_status, _, _ = par2_record_status(ident)
+
+        attention = []
+        informational = []
+        failure = False
+
+        if sha_status == "ISSUES FOUND":
+            attention.append(
+                "SHA-256 checksum verification reported issues"
+            )
+            failure = True
+        elif sha_status == "INCOMPLETE":
+            attention.append(
+                "SHA-256 checksum verification INCOMPLETE"
+            )
+        elif sha_status == "VERIFY NEEDED":
+            attention.append(
+                "SHA-256 checksum verification needed"
+            )
+        elif sha_status == "PASSED":
+            if "OVERDUE" in due(r):
+                attention.append(
+                    "SHA-256 checksum verification overdue"
+                )
+        elif sha_status == "NOT INITIALIZED":
+            informational.append(
+                "SHA-256 checksum catalog not initialized"
+            )
+        elif sha_status == "NOT VERIFIED":
+            informational.append(
+                "SHA-256 checksum verification not yet recorded"
+            )
+
+        # Highlight registrations still awaiting a complete check.
+        if r["pending"] and sha_status != "VERIFY NEEDED":
+            attention.append(
+                "New SHA-256 registrations await verification"
+            )
+
+        if par2_status == "FAILED":
+            attention.append("PAR2 recovery verification FAILED")
+            failure = True
+        elif par2_status in (
+            "INCOMPLETE", "REVIEW NEEDED",
+            "BASELINE NEEDED", "SUPPLEMENT NEEDED",
+            "VERIFY NEEDED"
+        ):
+            attention.append("PAR2 recovery: " + par2_status)
+        elif par2_status == "COVERAGE RECORDED":
+            informational.append(
+                "PAR2 coverage recorded; verification not recorded"
+            )
+        elif par2_status == "NOT VERIFIED":
+            informational.append(
+                "PAR2 recovery verification not recorded"
+            )
+
+        if attention:
+            attention_class = "bad" if failure else "warn"
+            body += (
+                '<div class="storage-attention '
+                + attention_class + '">'
+                '<strong>Attention:</strong> '
+                + esc("; ".join(attention))
+                + '</div>'
+            )
+        elif informational:
+            body += (
+                '<div class="storage-attention storage-note">'
+                '<strong>Attention:</strong> No urgent flags'
+                ' · ' + esc("; ".join(informational))
+                + '</div>'
+            )
+        else:
+            body += (
+                '<div class="storage-attention storage-note">'
+                '<strong>Attention:</strong> No flags'
+                '</div>'
+            )
+
         body+='</div>'
     if not drives:body+='<p class="muted">No drives registered yet.</p>'
     return body+'</section>'
+
+def drive_sha256_status(db, drive):
+    """Summarize the current catalog against recorded full checks."""
+    ident = drive["id"]
+    count = int(drive["file_count"] or 0)
+
+    if count == 0:
+        # A registered drive need not have a SHA-256 catalog yet.
+        # Consult only saved metadata; never scan or hash the disk.
+        manifest = DEVICES / ident / "manifests" / "baseline.sha256"
+        prior_registration = db.execute(
+            "SELECT 1 FROM runs WHERE drive_id=? "
+            "AND action='register' LIMIT 1",
+            (ident,)
+        ).fetchone()
+
+        if not manifest.exists() and prior_registration is None:
+            return (
+                "NOT INITIALIZED", "muted",
+                "This drive is registered, but no SHA-256 "
+                "checksum catalog has been initialized."
+            )
+
+        return (
+            "NOT VERIFIED", "muted",
+            "No cataloged files available for SHA-256 verification."
+        )
+
+    latest = db.execute(
+        "SELECT seq,result,tracked,delta,issues "
+        "FROM runs WHERE drive_id=? AND action='verify' "
+        "ORDER BY seq DESC LIMIT 1",
+        (ident,)
+    ).fetchone()
+
+    if latest is None:
+        return (
+            "NOT VERIFIED", "muted",
+            "No SHA-256 verification recorded for this drive."
+        )
+
+    result = latest["result"]
+
+    if result != "PASS":
+        if result == "INCOMPLETE":
+            return (
+                "INCOMPLETE", "warn",
+                "The latest verification did not finish successfully."
+            )
+        return (
+            "ISSUES FOUND", "warn",
+            "The latest verification did not pass. "
+            "Review the recorded operations and issues."
+        )
+
+    # A successful registration after verification invalidates
+    # the previous PASS for the current catalog.
+    latest_addition = db.execute(
+        "SELECT seq FROM runs "
+        "WHERE drive_id=? AND action='register' "
+        "AND result='PASS' AND delta>0 "
+        "ORDER BY seq DESC LIMIT 1",
+        (ident,)
+    ).fetchone()
+
+    if (
+        drive["pending"]
+        or (
+            latest_addition is not None
+            and latest_addition["seq"] > latest["seq"]
+        )
+    ):
+        return (
+            "VERIFY NEEDED", "warn",
+            "New SHA-256 registrations are awaiting verification."
+        )
+
+    if (
+        int(latest["tracked"]) != count
+        or int(latest["delta"]) != 0
+        or int(latest["issues"]) != 0
+    ):
+        return (
+            "VERIFY NEEDED", "warn",
+            "The latest check does not establish a complete "
+            "PASS for the current catalog."
+        )
+
+    return (
+        "PASSED", "good",
+        f"All {count:,} cataloged files matched their saved "
+        "SHA-256 checksums during the last complete check."
+    )
+
+
+def par2_verification_receipts(ident):
+    """Interpret recorded PAR2 checks without running verification."""
+    import runpy
+    from collections import defaultdict
+
+    history = pathlib.Path(
+        "/config/par2-verification-history.jsonl"
+    )
+
+    if not history.exists():
+        return "COVERAGE RECORDED", "No PAR2 verification recorded."
+
+    try:
+        if history.is_symlink() or history.stat().st_size > 16000000:
+            raise ValueError("Unsafe or oversized history")
+
+        module = runpy.run_path(
+            "/app/assets/par2-verify-records.py",
+            run_name="par2_receipt_reader"
+        )
+
+        sets = module["inventory"](ident)
+        expected = {}
+
+        for folder, name, index, volumes in sets:
+            key = (folder, name)
+            if key in expected:
+                raise ValueError("Duplicate recovery set")
+
+            expected[key] = module["fingerprint"](
+                index, volumes
+            )
+
+        if not expected:
+            return "COVERAGE RECORDED", "No selected recovery sets."
+
+        events = defaultdict(list)
+
+        for line in history.read_text(
+            encoding="utf-8"
+        ).splitlines():
+            receipt = json.loads(line)
+
+            if not isinstance(receipt, dict):
+                raise ValueError("Invalid verification receipt")
+
+            if receipt.get("drive") != ident:
+                continue
+
+            if (
+                receipt.get("schema_version") != 1
+                or receipt.get("event") not in (
+                    "START", "PASS", "FAIL"
+                )
+                or not isinstance(
+                    receipt.get("fingerprint"), str
+                )
+                or not isinstance(
+                    receipt.get("run_id"), str
+                )
+            ):
+                raise ValueError("Invalid verification event")
+
+            key = (
+                receipt.get("folder"),
+                receipt.get("set")
+            )
+
+            if key in expected:
+                events[key].append(receipt)
+
+        verified = 0
+        failed = False
+        incomplete = False
+        changed = False
+        inconsistent = False
+
+        for key, fingerprint in expected.items():
+            records = events[key]
+
+            if not records:
+                continue
+
+            last = records[-1]
+
+            if last["event"] == "START":
+                incomplete = True
+                continue
+
+            if len(records) < 2:
+                inconsistent = True
+                continue
+
+            start = records[-2]
+
+            if (
+                start["event"] != "START"
+                or start["run_id"] != last["run_id"]
+                or start["fingerprint"]
+                    != last["fingerprint"]
+            ):
+                inconsistent = True
+                continue
+
+            if last["event"] == "FAIL":
+                failed = True
+                continue
+
+            if last["fingerprint"] != fingerprint:
+                changed = True
+                continue
+
+            if last["event"] == "PASS":
+                verified += 1
+
+        total = len(expected)
+
+        if failed:
+            return "FAILED", (
+                "A recorded PAR2 recovery verification failed."
+            )
+
+        if incomplete:
+            return "INCOMPLETE", (
+                "A PAR2 recovery verification did not finish."
+            )
+
+        if inconsistent:
+            return "REVIEW NEEDED", (
+                "PAR2 verification history is inconsistent."
+            )
+
+        if changed:
+            return "VERIFY NEEDED", (
+                "Recovery set metadata changed since verification."
+            )
+
+        if verified == total:
+            return "VERIFIED", (
+                f"{verified} of {total} PAR2 recovery sets "
+                "successfully verified."
+            )
+
+        return "COVERAGE RECORDED", (
+            f"{verified} of {total} recovery sets have "
+            "current successful verification records."
+        )
+
+    except (Exception, SystemExit):
+        return "REVIEW NEEDED", (
+            "PAR2 verification history could not be validated."
+        )
+
+
+def par2_record_status(ident):
+    """Summarize selected-folder PAR2 coverage without verifying files."""
+    import subprocess
+    import sys
+
+    registry = pathlib.Path("/config/par2-selections.json")
+    reader = pathlib.Path("/app/assets/par2-coverage-reader.py")
+
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", ident):
+        return "REVIEW NEEDED", "warn", "Invalid drive identifier."
+
+    try:
+        if registry.is_symlink() or not registry.is_file():
+            raise ValueError("Selection registry unavailable")
+        data = json.loads(registry.read_text(encoding="utf-8"))
+        if data.get("schema_version") != 1:
+            raise ValueError("Unsupported selection registry")
+        drives = data["drives"]
+        if not isinstance(drives, dict):
+            raise ValueError("Invalid selection registry")
+        folders = drives.get(ident, [])
+        if not isinstance(folders, list):
+            raise ValueError("Invalid folder selection")
+    except (OSError, ValueError, KeyError, TypeError):
+        return (
+            "REVIEW NEEDED", "warn",
+            "PAR2 selection records could not be read."
+        )
+
+    if not folders:
+        parity = pathlib.Path("/records/parity") / ident
+        if parity.is_symlink():
+            return "REVIEW NEEDED", "warn", "Invalid PAR2 records path."
+        if parity.is_dir() and any(parity.rglob("recovery.par2")):
+            return (
+                "REVIEW NEEDED", "warn",
+                "Existing PAR2 sets need a recorded folder selection."
+            )
+        return (
+            "NOT SELECTED", "muted",
+            "No folders selected for optional PAR2 recovery."
+        )
+
+    if not all(
+        isinstance(f, str)
+        and bool(f)
+        and not f.startswith("/")
+        and all(p not in ("", ".", "..") for p in f.split("/"))
+        and not any(ord(c) < 32 for c in f)
+        for f in folders
+    ):
+        return "REVIEW NEEDED", "warn", "Invalid PAR2 folder selection."
+
+    if len(set(folders)) != len(folders):
+        return "REVIEW NEEDED", "warn", "Duplicate PAR2 folder selections."
+
+    for i, folder in enumerate(folders):
+        if any(
+            folder.startswith(other + "/")
+            or other.startswith(folder + "/")
+            for other in folders[:i]
+        ):
+            return "REVIEW NEEDED", "warn", "Overlapping PAR2 selections."
+
+    states = []
+    for folder in folders:
+        try:
+            result = subprocess.run(
+                [sys.executable, str(reader), ident, folder],
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            states.append("REVIEW NEEDED")
+            continue
+
+        output = result.stdout + result.stderr
+
+        if result.returncode != 0:
+            if any(word in output.lower() for word in (
+                "incomplete supplement",
+                "recovery volumes missing",
+                "missing recovery-set"
+            )):
+                states.append("INCOMPLETE")
+            else:
+                states.append("REVIEW NEEDED")
+        elif "COVERAGE PASS" in output:
+            states.append("COVERAGE RECORDED")
+        elif "PAR2 baseline: NOT CREATED" in output:
+            states.append("BASELINE NEEDED")
+        elif "COVERAGE UNAVAILABLE" in output:
+            states.append("NOT VERIFIED")
+        elif "COVERAGE REVIEW REQUIRED" in output:
+            missing = re.search(
+                r"Registered files without PAR2: (\d+)", output
+            )
+            extra = re.search(
+                r"PAR2 entries absent from SHA-256: (\d+)", output
+            )
+            if extra and int(extra.group(1)) > 0:
+                states.append("REVIEW NEEDED")
+            elif missing and int(missing.group(1)) > 0:
+                states.append("SUPPLEMENT NEEDED")
+            else:
+                states.append("REVIEW NEEDED")
+        else:
+            states.append("REVIEW NEEDED")
+
+    priority = (
+        "INCOMPLETE",
+        "REVIEW NEEDED",
+        "BASELINE NEEDED",
+        "SUPPLEMENT NEEDED",
+        "NOT VERIFIED",
+        "COVERAGE RECORDED"
+    )
+
+    overall = next(s for s in priority if s in states)
+    color = (
+        "warn" if overall in (
+            "INCOMPLETE", "REVIEW NEEDED",
+            "BASELINE NEEDED", "SUPPLEMENT NEEDED"
+        ) else "muted"
+    )
+
+    covered = states.count("COVERAGE RECORDED")
+    note = (
+        f"{covered} of {len(folders)} selected folders have "
+        "recorded PAR2 filename coverage. "
+        "Recovery volumes were not reverified."
+    )
+    if overall == "COVERAGE RECORDED":
+        receipt_status, receipt_note = (
+            par2_verification_receipts(ident)
+        )
+
+        if receipt_status == "VERIFIED":
+            return "VERIFIED", "ok", receipt_note
+
+        if receipt_status in (
+            "FAILED", "INCOMPLETE",
+            "REVIEW NEEDED", "VERIFY NEEDED"
+        ):
+            status_color = (
+                "bad" if receipt_status == "FAILED"
+                else "warn"
+            )
+            return receipt_status, status_color, receipt_note
+
+        return overall, color, note + " " + receipt_note
+
+    return overall, color, note
+
 
 def layout(body):
     return ('<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" '
@@ -321,10 +1050,11 @@ def layout(body):
             '<link rel="icon" type="image/png" href="/assets/favicon-32.png">'+CSS+
             '<header><div class="brand"><img src="/assets/dashboard-icon.png" alt="" width="52" height="52">'
             '<div><h1>Cold Storage</h1><small>Offline archive catalog</small></div><label class="theme-control" for="theme">Theme <select id="theme" aria-label="Color theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label></div></header>'
-            '<main><nav><a href="/files">'+disk_icon()+'Archive Drives</a>'
-            '<a href="/index">Master Index</a><a href="/">Overview</a>'
-            '<a href="/history">Verification history</a></nav>'+body+
-            '<footer><span>Read-only archive metadata · Catalog refresh never verifies files</span><span>Cold Storage v'+esc(APP_VERSION)+'</span></footer></main><script src="/assets/theme.js" defer></script></html>')
+            '<main><nav><a href="/">Overview</a>'
+            '<a href="/files">'+disk_icon()+'Archive Drives</a>'
+            '<a href="/index">Master Index</a>'
+            '<a href="/history">Verification history</a><a href="/commands">Commands</a></nav>'+body+
+            '<footer><span>Read-only archive metadata · Catalog refresh never verifies files</span><span>Cold Storage v'+esc(APP_VERSION)+'</span></footer></main><script src="/assets/theme.js" defer></script><script src="/assets/verify-command.js" defer></script></html>')
 
 def master_index(db, q):
     term=q.get('q',[''])[0][:300].strip()
@@ -373,11 +1103,11 @@ def master_index(db, q):
 
 class Handler(BaseHTTPRequestHandler):
     def asset(self,name):
-        if name not in ('dashboard-icon.png','favicon-32.png','favicon-16.png','theme.js'):
+        if name not in ('dashboard-icon.png','favicon-32.png','favicon-16.png','theme.js','verify-command.js'):
             self.send_error(404);return
         try:data=(pathlib.Path(__file__).parent/'assets'/name).read_bytes()
         except OSError:self.send_error(404);return
-        self.send_response(200);self.send_header('Content-Type','application/javascript; charset=utf-8' if name=='theme.js' else 'image/png')
+        self.send_response(200);self.send_header('Content-Type','application/javascript; charset=utf-8' if name in ('theme.js','verify-command.js') else 'image/png')
         self.send_header('Content-Length',str(len(data)))
         self.send_header('Cache-Control','public, max-age=86400')
         self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(data)
@@ -393,21 +1123,14 @@ class Handler(BaseHTTPRequestHandler):
                 body,status=master_index(db,q);self.respond(body,status);return
             if route.path=='/':
                 drives=db.execute('SELECT * FROM drives ORDER BY id').fetchall()
-                total=sum(r['file_count'] for r in drives)
-                updated=db.execute("SELECT value FROM meta WHERE key='last_refresh'").fetchone()
-                body=f'<div class="grid"><div class="metric">Registered drives<b>{len(drives)}</b></div><div class="metric">Cataloged files<b>{total:,}</b></div><div class="metric">Catalog refreshed<b style="font-size:15px">{esc(when(updated[0]) if updated else "Never")}</b></div></div>'
-                body+=storage_overview(db,drives)
-                body+='<section class="panel"><h2>Manual catalog actions</h2><p class="muted">Refresh imports registered filenames and integrity logs, and records space statistics for identity-verified mounted archive drives. It never reads archived file contents or runs SHA-256 verification.</p><form method="post" action="/refresh"><button>Refresh catalog</button></form><p><form method="post" action="/backup"><button>Back up SQLite database to array</button></form></p></section>'
-                body+='<section class="panel"><h2>'+disk_icon()+'Archive drives</h2><table><tr><th>Drive</th><th>Files</th><th>Last successful check</th><th>Next due</th><th>Attention</th></tr>'
-                for r in drives:
-                    attention=[]
-                    if r['pending']: attention.append('New registrations since last PASS')
-                    if r['last_result'] and r['last_result']!='PASS': attention.append('Latest verification: '+r['last_result'])
-                    if not r['last_pass']: attention.append('No successful full verification')
-                    issue_count=db.execute('SELECT COUNT(*) FROM issues WHERE drive_id=?',(r['id'],)).fetchone()[0]
-                    if issue_count: attention.append(f'{issue_count} historical issue entries')
-                    body+=f'<tr><td><a href="/drive?id={urllib.parse.quote(r["id"])}"><code>{esc(r["id"])}</code></a><div class="muted">{esc(r["model"])}</div></td><td>{r["file_count"]}</td><td>{esc(when(r["last_pass"]))}</td><td>{esc(due(r))}</td><td class="{ "warn" if attention else "good" }">{esc("; ".join(attention) if attention else "No flags")}</td></tr>'
-                body+='</table></section>'
+                # Primary section: archive storage information.
+                body=storage_overview(db,drives)
+
+                # Final section: manual catalog controls.
+                body+='<section class="panel" aria-label="Catalog maintenance"><div class="catalog-action-buttons"><form method="post" action="/refresh"><button>Refresh catalog</button></form><form method="post" action="/backup"><button>Back up SQLite database to array</button></form></div></section>'
+                self.respond(body);return
+            if route.path=='/commands':
+                body='<section class="panel"><h2>Terminal Commands</h2><p class="muted">Commands are for use in unRAID Terminal. Selecting a command does not execute it.</p><div class="verify-command-tool"><h3>SHA-256 Checksums</h3><p class="muted checksum-intro">Select a command, copy it, and paste it into unRAID Terminal. One mounted archive drive is required.</p><div class="checksum-actions"><div class="checksum-action"><strong>SHA-256 Checksum Registration</strong><p class="muted">Save checksums for new files.</p><input id="sha256-register-command" type="text" readonly aria-label="SHA-256 checksum registration command" value="bash /boot/custom/cold-storage/integrity.sh register"></div><div class="checksum-action"><strong>SHA-256 Checksum Verification</strong><p class="muted">Compare files with saved checksums.</p><input id="sha256-command" type="text" readonly aria-label="SHA-256 checksum verification command" value="bash /boot/custom/cold-storage/integrity.sh verify"></div></div></div><div class="verify-command-tool"><h3>PAR2 Recovery</h3><p class="muted checksum-intro">Optional recovery protection. Select and copy a command for unRAID Terminal. Commands do not run from this page.</p><div class="checksum-actions"><div class="checksum-action"><strong>Manage Recovery Files</strong><p class="muted">Interactively select a drive and folder to plan or create a PAR2 baseline.</p><input id="par2-manager-command" type="text" readonly aria-label="PAR2 recovery manager command" value="bash /boot/custom/cold-storage/par2-manager.sh"></div><div class="checksum-action"><strong>Add Recovery Supplement</strong><p class="muted">Replace DRIVE_ID and FOLDER/PATH with the registered drive identifier and relative folder path.</p><input id="par2-supplement-command" type="text" readonly aria-label="PAR2 supplement creation command" value="bash /boot/custom/cold-storage/par2-supplement-create.sh DRIVE_ID &quot;FOLDER/PATH&quot;"></div><div class="checksum-action"><strong>Plan Recovery Verification</strong><p class="muted">List the existing PAR2 recovery sets without verifying file contents. Permanent launcher available after the 0.6.0 upgrade.</p><input id="par2-plan-command" type="text" readonly aria-label="PAR2 verification plan command" value="bash /boot/custom/cold-storage/par2-verify.sh plan DRIVE_ID"></div><div class="checksum-action"><strong>Verify Recovery Sets</strong><p class="muted">Verify existing recovery sets and record results. Requires confirmation and the permanent launcher installed with 0.6.0.</p><input id="par2-verify-command" type="text" readonly aria-label="PAR2 recovery verification command" value="bash /boot/custom/cold-storage/par2-verify.sh verify DRIVE_ID"></div></div></div></section>'
                 self.respond(body);return
             if route.path=='/files':
                 term=q.get('q',[''])[0][:300].strip()
@@ -479,15 +1202,158 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(body+'</section>');return
             if route.path=='/drive':
                 ident=q.get('id',[''])[0]
-                r=db.execute('SELECT * FROM drives WHERE id=?',(ident,)).fetchone()
-                if not r:self.respond('<div class="panel">Drive not found</div>',404);return
-                runs=db.execute('SELECT * FROM runs WHERE drive_id=? ORDER BY seq DESC LIMIT 20',(ident,)).fetchall()
-                body=f'<section class="panel"><h2>{esc(ident)}</h2><p>Model: {esc(r["model"])} · Serial: {esc(r["serial"])} · Capacity: {r["capacity"]:,} bytes</p><p>Cataloged files: <b>{r["file_count"]}</b> · Last PASS: <b>{esc(when(r["last_pass"]))}</b> · Next due: <b>{esc(due(r))}</b></p><p class="{ "warn" if r["pending"] else "muted" }">{ "New registrations since last successful full verification" if r["pending"] else "No new registration flag" }</p><p><a href="/files?drive={urllib.parse.quote(ident)}">Browse this drive’s files →</a></p></section><section class="panel"><h2>Recent operations</h2><table><tr><th>Local Time</th><th>Action</th><th>Result</th><th>Tracked</th><th>Delta</th><th>Issues</th></tr>'
-                for x in runs:body+=f'<tr><td>{esc(when(x["stamp"]))}</td><td>{esc(x["action"])}</td><td>{esc(x["result"])}</td><td>{x["tracked"]}</td><td>{x["delta"]}</td><td>{x["issues"]}</td></tr>'
-                issues=db.execute('SELECT raw FROM issues WHERE drive_id=? ORDER BY seq DESC LIMIT 50',(ident,)).fetchall()
-                body+='</table></section><section class="panel"><h2>Historical issue records</h2>'
-                body+=('<p>No issue records found.</p>' if not issues else '<ul>'+''.join('<li><code>'+esc(x['raw'])+'</code></li>' for x in issues)+'</ul>')
-                self.respond(body+'</section>');return
+                r=db.execute(
+                    'SELECT * FROM drives WHERE id=?',(ident,)
+                ).fetchone()
+
+                if not r:
+                    self.respond(
+                        '<section class="panel">Drive not found</section>',404
+                    )
+                    return
+
+                runs=db.execute(
+                    'SELECT * FROM runs WHERE drive_id=? '
+                    'ORDER BY seq DESC LIMIT 20',(ident,)
+                ).fetchall()
+
+                issues=db.execute(
+                    'SELECT raw FROM issues WHERE drive_id=? '
+                    'ORDER BY seq DESC LIMIT 50',(ident,)
+                ).fetchall()
+
+                # Compact drive identification.
+                body='<section class="panel">'
+                body+='<h2>'+disk_icon()+esc(r["model"] or ident)+'</h2>'
+                body+='<p class="muted"><code>'+esc(ident)+'</code></p>'
+                body+=(
+                    '<p class="muted">Brand: '
+                    +esc(drive_brand(r["model"]))
+                    +' · Serial: '
+                    +esc(r["serial"] or "Unknown")
+                    +' · Capacity: '
+                    +esc(human_bytes(r["capacity"]))
+                    +'</p>'
+                )
+
+                # Concise SHA-256 status for the selected drive.
+                status_label, status_class, status_note = (
+                    drive_sha256_status(db, r)
+                )
+
+                body+='<div class="drive-facts">'
+
+                body+=(
+                    '<div><small>Cataloged Files</small><strong>'
+                    +str(r["file_count"])
+                    +'</strong></div>'
+                )
+
+                body+=(
+                    '<div><small>SHA-256 Checksum Verification</small>'
+                    '<strong class="'+status_class+'">'
+                    +esc(status_label)
+                    +'</strong></div>'
+                )
+
+                next_check = (
+                    due(r) if status_label == "PASSED"
+                    else (
+                        "NOT SCHEDULED"
+                        if int(r["file_count"] or 0) == 0
+                        else "VERIFY NEEDED"
+                    )
+                )
+                next_check_class = (
+                    "warn"
+                    if next_check == "VERIFY NEEDED"
+                    or "OVERDUE" in next_check
+                    else ""
+                )
+
+                body+=(
+                    '<div><small>Next SHA-256 Check</small>'
+                    '<strong class="'+next_check_class+'">'
+                    +esc(next_check)+'</strong></div>'
+                )
+
+                par2_label, par2_class, par2_note = (
+                    par2_record_status(ident)
+                )
+
+                body+=(
+                    '<div><small>PAR2 Recovery</small>'
+                    '<strong class="'+par2_class+'">'
+                    +esc(par2_label)
+                    +'</strong></div>'
+                )
+
+                body+='</div>'
+                body+='<p class="muted">'+esc(status_note)+'</p>'
+                body+='<p class="muted">'+esc(par2_note)+'</p>'
+
+                body+=(
+                    '<p class="muted">Verification interval: '
+                    +str(r["interval_days"] or 180)
+                    +' days</p>'
+                )
+
+                body+=(
+                    '<p><a href="/files?drive='
+                    +urllib.parse.quote(ident)
+                    +'">Browse this drive\'s files →</a></p>'
+                )
+                body+='</section>'
+
+                # Retain detailed history without crowding the page.
+                body+='<section class="panel drive-history">'
+
+                body+=(
+                    '<details><summary>Recent Operations ('
+                    +str(len(runs))
+                    +')</summary>'
+                )
+
+                if runs:
+                    body+=(
+                        '<div class="drive-table"><table>'
+                        '<tr><th>Local Time</th><th>Action</th>'
+                        '<th>Result</th><th>Tracked</th>'
+                        '<th>Delta</th><th>Issues</th></tr>'
+                    )
+                    for x in runs:
+                        body+=(
+                            '<tr><td>'+esc(when(x["stamp"]))+'</td>'
+                            '<td>'+esc(x["action"])+'</td>'
+                            '<td>'+esc(x["result"])+'</td>'
+                            '<td>'+str(x["tracked"])+'</td>'
+                            '<td>'+str(x["delta"])+'</td>'
+                            '<td>'+str(x["issues"])+'</td></tr>'
+                        )
+                    body+='</table></div>'
+                else:
+                    body+='<p class="muted">No operations recorded.</p>'
+
+                body+='</details>'
+
+                body+=(
+                    '<details><summary>Historical Issue Records ('
+                    +str(len(issues))
+                    +' shown)</summary>'
+                )
+
+                if issues:
+                    body+='<ul>'
+                    for x in issues:
+                        body+='<li><code>'+esc(x["raw"])+'</code></li>'
+                    body+='</ul>'
+                else:
+                    body+='<p class="muted">No issue records found.</p>'
+
+                body+='</details></section>'
+
+                self.respond(body)
+                return
             if route.path=='/history':
                 rows=db.execute('SELECT * FROM runs ORDER BY stamp DESC LIMIT 200').fetchall()
                 body='<section class="panel"><h2>Verification and registration history</h2><table><tr><th>Local Time</th><th>Drive</th><th>Action</th><th>Result</th><th>Issues</th></tr>'
