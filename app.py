@@ -2,12 +2,23 @@ import os, re, json, sqlite3, pathlib, datetime, threading, html, urllib.parse, 
 from zoneinfo import ZoneInfo
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from contextlib import closing
+from inventory import scan_files
+from failure_records import (
+    unresolved_failures,
+    normalize_issue_path,
+    KNOWN_KINDS,
+)
+from indicators import (
+    build_indicator_index,
+    summary_status,
+    checkmark_html,
+)
 
 DB = os.getenv('DB_PATH', '/config/cold_storage.db')
 DEVICES = pathlib.Path(os.getenv('DEVICES_PATH', '/records/devices'))
 BACKUPS = pathlib.Path(os.getenv('BACKUPS_PATH', '/backups'))
 PORT = int(os.getenv('PORT', '8080'))
-APP_VERSION = '0.6.0'
+APP_VERSION = '0.7.0'
 LOCK = threading.Lock()
 UTC = datetime.timezone.utc
 LOCAL_TZ = ZoneInfo(os.environ.get("TZ", "America/Detroit"))
@@ -24,13 +35,57 @@ def init():
     with closing(connect()) as db:
         db.executescript('''
         CREATE TABLE IF NOT EXISTS drives (id TEXT PRIMARY KEY, model TEXT, serial TEXT, capacity INTEGER, registered TEXT, interval_days INTEGER, file_count INTEGER, last_pass TEXT, last_verify TEXT, last_result TEXT, pending INTEGER, latest_registration TEXT);
-        CREATE TABLE IF NOT EXISTS files (drive_id TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT NOT NULL, PRIMARY KEY(drive_id,path));
+        CREATE TABLE IF NOT EXISTS files (drive_id TEXT NOT NULL, path TEXT NOT NULL, sha256 TEXT, PRIMARY KEY(drive_id,path));
         CREATE INDEX IF NOT EXISTS files_path ON files(path COLLATE NOCASE);
         CREATE TABLE IF NOT EXISTS runs (drive_id TEXT, seq INTEGER, stamp TEXT, action TEXT, result TEXT, tracked INTEGER, delta INTEGER, issues INTEGER, PRIMARY KEY(drive_id,seq));
         CREATE TABLE IF NOT EXISTS issues (drive_id TEXT, seq INTEGER, raw TEXT, PRIMARY KEY(drive_id,seq));
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY,value TEXT);
         CREATE TABLE IF NOT EXISTS storage_snapshots (drive_id TEXT PRIMARY KEY, used_bytes INTEGER NOT NULL, available_bytes INTEGER NOT NULL, captured_at TEXT NOT NULL, FOREIGN KEY(drive_id) REFERENCES drives(id));
         ''')
+        # v0.7.0: catalog entries may have no registered SHA-256.
+        columns = {
+            row["name"]: row
+            for row in db.execute("PRAGMA table_info(files)")
+        }
+        if columns["sha256"]["notnull"]:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                before = db.execute(
+                    "SELECT COUNT(*) FROM files"
+                ).fetchone()[0]
+                db.execute(
+                    "CREATE TABLE files_v070 ("
+                    "drive_id TEXT NOT NULL, "
+                    "path TEXT NOT NULL, "
+                    "sha256 TEXT, "
+                    "PRIMARY KEY(drive_id,path))"
+                )
+                db.execute(
+                    "INSERT INTO files_v070(drive_id,path,sha256) "
+                    "SELECT drive_id,path,sha256 FROM files"
+                )
+                after = db.execute(
+                    "SELECT COUNT(*) FROM files_v070"
+                ).fetchone()[0]
+                if before != after:
+                    raise RuntimeError("Migration count mismatch")
+
+                db.execute("DROP TABLE files")
+                db.execute(
+                    "ALTER TABLE files_v070 RENAME TO files"
+                )
+                db.execute(
+                    "CREATE INDEX files_path "
+                    "ON files(path COLLATE NOCASE)"
+                )
+                if db.execute(
+                    "PRAGMA integrity_check"
+                ).fetchone()[0] != "ok":
+                    raise RuntimeError("SQLite integrity failure")
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
         db.commit()
 
 def parse_manifest(path):
@@ -67,29 +122,196 @@ def parse_manifest(path):
         raise ValueError('Duplicate file paths in manifest')
     return result
 
+
+def _strict_log_lines(path):
+    """Read complete, regular verification log records."""
+    if path.is_symlink():
+        raise ValueError(
+            f"Verification log is a symbolic link: {path.name}"
+        )
+
+    if not path.exists():
+        return []
+
+    if not path.is_file():
+        raise ValueError(
+            f"Verification log is not a regular file: {path.name}"
+        )
+
+    content = path.read_text(encoding="utf-8")
+
+    if content and not content.endswith("\n"):
+        raise ValueError(
+            f"Verification log has an incomplete final line: "
+            f"{path.name}"
+        )
+
+    lines = content.splitlines()
+
+    if any(not line for line in lines):
+        raise ValueError(
+            f"Verification log contains an empty record: "
+            f"{path.name}"
+        )
+
+    return lines
+
+
 def read_runs(path):
-    out=[]
-    if not path.is_file(): return out
-    for line in path.read_text(encoding='utf-8').splitlines():
-        if not line.strip():continue
-        parts=line.split('\t')
-        if len(parts)<6: parts=line.split()
-        if len(parts)<6: continue
-        try: out.append((parts[0],parts[1],parts[2],int(parts[3]),int(parts[4]),int(parts[5])))
-        except ValueError: continue
-    return out
+    """Reject malformed records instead of silently skipping them."""
+    result = []
+
+    for number, line in enumerate(
+        _strict_log_lines(path), start=1
+    ):
+        fields = line.split("\t")
+
+        if len(fields) != 6:
+            raise ValueError(
+                f"Invalid runs.tsv column count at line {number}"
+            )
+
+        stamp, action, outcome, tracked, delta, issues = fields
+
+        if not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+            stamp
+        ):
+            raise ValueError(
+                f"Invalid run timestamp at line {number}"
+            )
+
+        if action not in ("register", "verify"):
+            raise ValueError(
+                f"Unknown run action at line {number}"
+            )
+
+        if outcome not in ("PASS", "FAIL", "INCOMPLETE") and not (
+            action == "register" and outcome == "NO_CHANGES"
+        ):
+            raise ValueError(
+                f"Unknown run result at line {number}"
+            )
+
+        try:
+            counts = (
+                int(tracked),
+                int(delta),
+                int(issues)
+            )
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid run counters at line {number}"
+            ) from exc
+
+        if (
+            counts[0] < 0
+            or counts[1] < 0
+            or counts[2] < -1
+        ):
+            raise ValueError(
+                f"Invalid run counter values at line {number}"
+            )
+
+        result.append(
+            (stamp, action, outcome, *counts)
+        )
+
+    return result
+
 
 def read_issues(path):
-    if not path.is_file(): return []
-    return path.read_text(encoding='utf-8',errors='replace').splitlines()
+    """Validate issue records without changing their saved text."""
+    result = []
 
-def refresh():
+    for number, line in enumerate(
+        _strict_log_lines(path), start=1
+    ):
+        fields = line.split("\t")
+
+        if len(fields) != 3:
+            raise ValueError(
+                f"Invalid issues.tsv column count at line {number}"
+            )
+
+        stamp, kind, relative_path = fields
+
+        if not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+            stamp
+        ):
+            raise ValueError(
+                f"Invalid issue timestamp at line {number}"
+            )
+
+        if kind not in KNOWN_KINDS:
+            raise ValueError(
+                f"Unknown issue kind at line {number}"
+            )
+
+        try:
+            normalize_issue_path(relative_path)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid issue path at line {number}"
+            ) from exc
+
+        result.append(line)
+
+    return result
+
+
+
+def require_append_only_history(
+    ident, stored_runs, stored_issues, incoming_runs, incoming_issues
+):
+    """Reject lost, reordered, or rewritten verification history.
+
+    New log records may be appended, but stored records must
+    remain unchanged. No operation on archive files is performed.
+    """
+    for label, previous, current in (
+        ("runs", stored_runs, incoming_runs),
+        ("issues", stored_issues, incoming_issues),
+    ):
+        previous=list(previous)
+        current=list(current)
+
+        if (
+            len(current) < len(previous)
+            or current[:len(previous)] != previous
+        ):
+            raise ValueError(
+                f"{ident}: {label} verification history "
+                "is missing, truncated, reordered, or modified. "
+                "Catalog refresh stopped; saved history retained."
+            )
+
+
+def refresh(drive_id=None):
+    # A targeted refresh must never inspect other archive drives.
+    if drive_id is not None:
+        if (
+            not isinstance(drive_id, str)
+            or not re.fullmatch(
+                r"[A-Za-z0-9._-]{1,256}", drive_id
+            )
+        ):
+            return 0, ["Invalid target drive identifier"]
+
     # Parse and validate ALL sources before changing the DB.
     parsed=[]; errors=[]
     if not DEVICES.is_dir(): return 0,[f'Device directory unavailable: {DEVICES}']
     for folder in sorted(DEVICES.iterdir()):
+        if drive_id is not None:
+            if folder.name != drive_id:
+                continue
+            if folder.is_symlink():
+                return 0, ["Target drive records are a symbolic link"]
         if not folder.is_dir(): continue
         meta=folder/'device.json'
+        if drive_id is not None and meta.is_symlink():
+            return 0, ["Target drive metadata is a symbolic link"]
         if not meta.is_file(): continue
         try:
             data=json.loads(meta.read_text(encoding='utf-8'))
@@ -113,13 +335,111 @@ def refresh():
             parsed.append((data,files,runs,issues))
         except Exception as e: errors.append(f'{folder.name}: {e}')
     if errors: return 0,errors
+    if drive_id is not None:
+        if (
+            len(parsed) != 1
+            or parsed[0][0]["device_id"] != drive_id
+        ):
+            return 0, [
+                "Target drive registration is unavailable"
+            ]
+
+    # Stage the complete physical inventory before opening a write transaction.
+    # A failed scan must never replace the saved offline catalog.
+    try:
+        inventories,inventory_messages=stage_file_inventories(parsed)
+    except Exception as exc:
+        return 0,[
+            f"Physical inventory stopped; catalog unchanged: {exc}"
+        ]
+
+    if drive_id is not None and drive_id not in inventories:
+        return 0, [
+            "Target archive drive is offline or its physical "
+            "identity could not be verified. "
+            "Catalog unchanged."
+        ]
+
     snapshots,storage_messages=collect_storage_snapshots(parsed)
+    storage_messages.extend(inventory_messages)
     with LOCK:
         with closing(connect()) as db:
             try:
                 db.execute('BEGIN IMMEDIATE')
                 for data,files,runs,issues in parsed:
                     ident=data['device_id']
+
+                    if ident in inventories:
+                        staged=inventories[ident]
+                        staged_paths={path for path,_ in staged}
+
+                        if len(staged_paths)!=len(staged):
+                            raise ValueError(
+                                f"{ident}: duplicate physical inventory paths"
+                            )
+
+                        saved=db.execute(
+                            'SELECT path,sha256 FROM files WHERE drive_id=?',
+                            (ident,)
+                        ).fetchall()
+
+                        previous_paths={
+                            row['path'] for row in saved
+                        }
+                        saved_hashes={
+                            row['path']:row['sha256'] for row in saved
+                        }
+                        registered_paths={
+                            path for path,_ in (files or [])
+                        }
+
+                        missing=(
+                            previous_paths | registered_paths
+                        ) - staged_paths
+
+                        if missing:
+                            example=sorted(missing)[0]
+                            raise ValueError(
+                                f"{ident}: {len(missing)} previously "
+                                "cataloged or registered file(s) missing "
+                                f"from the physical inventory. Example: {example}. "
+                                "Catalog unchanged; review the drive."
+                            )
+
+                        staged_hashes=dict(staged)
+
+                        # Never silently discard a previously recorded checksum
+                        # because the manifest changed unexpectedly.
+                        if files is not None:
+                            lost=[
+                                path for path,checksum in saved_hashes.items()
+                                if checksum is not None
+                                and staged_hashes.get(path) is None
+                            ]
+                            if lost:
+                                raise ValueError(
+                                    f"{ident}: {len(lost)} saved checksum "
+                                    "record(s) absent from the manifest; "
+                                    "catalog unchanged."
+                                )
+
+                        if files is None:
+                            # An unavailable manifest does not erase previously
+                            # recorded checksums on existing catalog entries.
+                            files=[
+                                (
+                                    path,
+                                    checksum if checksum is not None
+                                    else saved_hashes.get(path)
+                                )
+                                for path,checksum in staged
+                            ]
+                        else:
+                            files=staged
+
+                    else:
+                        # Offline or unverified drives retain existing files.
+                        files=None
 
                     if files is None:
                         # Insert newly registered drives as metadata-only.
@@ -140,8 +460,8 @@ def refresh():
                             )
                         )
                         storage_messages.append(
-                            f"{ident}: SHA-256 manifest not initialized "
-                            "or unavailable; existing records preserved."
+                            f"{ident}: offline or identity not verified; "
+                            "existing catalog retained."
                         )
                         continue
 
@@ -154,6 +474,29 @@ def refresh():
                     pending=int(bool(last_reg and (not last_pass or last_reg>last_pass)))
                     db.execute('''INSERT INTO drives VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET model=excluded.model,serial=excluded.serial,capacity=excluded.capacity,registered=excluded.registered,interval_days=excluded.interval_days,file_count=excluded.file_count,last_pass=excluded.last_pass,last_verify=excluded.last_verify,last_result=excluded.last_result,pending=excluded.pending,latest_registration=excluded.latest_registration''',
                         (ident,data.get('model'),data.get('serial'),data.get('capacity_bytes'),data.get('registered_at'),data.get('verification_interval_days',180),len(files),last_pass,last_ver[0] if last_ver else None,last_ver[2] if last_ver else None,pending,last_reg))
+                    # Never replace saved integrity history with
+                    # missing, truncated, or rewritten source logs.
+                    # This protects unresolved failures across refreshes.
+                    stored_runs=db.execute(
+                        'SELECT stamp,action,result,tracked,delta,issues '
+                        'FROM runs WHERE drive_id=? ORDER BY seq',
+                        (ident,)
+                    ).fetchall()
+
+                    stored_issues=db.execute(
+                        'SELECT raw FROM issues '
+                        'WHERE drive_id=? ORDER BY seq',
+                        (ident,)
+                    ).fetchall()
+
+                    require_append_only_history(
+                        ident,
+                        [tuple(row) for row in stored_runs],
+                        [row[0] for row in stored_issues],
+                        runs,
+                        issues
+                    )
+
                     db.execute('DELETE FROM files WHERE drive_id=?',(ident,))
                     db.executemany('INSERT INTO files VALUES (?,?,?)',((ident,p,h) for p,h in files))
                     db.execute('DELETE FROM runs WHERE drive_id=?',(ident,))
@@ -162,7 +505,8 @@ def refresh():
                     db.executemany('INSERT INTO issues VALUES (?,?,?)',((ident,i,line) for i,line in enumerate(issues)))
                 db.execute('INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',('storage_refresh_report',json.dumps(storage_messages)))
                 db.executemany('''INSERT INTO storage_snapshots(drive_id,used_bytes,available_bytes,captured_at) VALUES (?,?,?,?) ON CONFLICT(drive_id) DO UPDATE SET used_bytes=excluded.used_bytes,available_bytes=excluded.available_bytes,captured_at=excluded.captured_at''', snapshots)
-                db.execute('INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',('last_refresh',datetime.datetime.now(UTC).isoformat(timespec='seconds')))
+                if drive_id is None:
+                    db.execute('INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',('last_refresh',datetime.datetime.now(UTC).isoformat(timespec='seconds')))
                 db.commit()
             except:
                 db.rollback();raise
@@ -270,6 +614,87 @@ def collect_storage_snapshots(parsed):
         except (OSError, ValueError) as exc:
             messages.append(f'{ident}: skipped ({exc}); snapshot retained')
     return candidates, messages
+
+
+def stage_file_inventories(parsed):
+    """Discover physical filenames only on hardware-verified archive drives.
+
+    Returns {drive_id: [(relative_path, sha256_or_none), ...]}, messages.
+    Offline or unidentified drives are deliberately absent from the result.
+    Scanning does not read file contents or write the catalog.
+    """
+    inventories = {}
+    messages = []
+
+    if not ARCHIVE_MOUNTS.is_dir() or not DISK_BY_ID.is_dir():
+        messages.append(
+            "Archive mounts or hardware identifiers unavailable; "
+            "existing inventories must be retained."
+        )
+        return inventories, messages
+
+    mounts = mounted_sources()
+
+    for data, manifest_files, _, _ in parsed:
+        ident = data["device_id"]
+        model = data.get("model")
+        serial = data.get("serial")
+
+        if (
+            not isinstance(model, str)
+            or not isinstance(serial, str)
+            or not re.fullmatch(r"[A-Za-z0-9_.-]+", ident)
+            or ident != model.replace(" ", "_") + "_" + serial
+        ):
+            messages.append(
+                f"{ident}: inconsistent registration identity; "
+                "saved catalog retained"
+            )
+            continue
+
+        mount = ARCHIVE_MOUNTS / ident
+        entry = mounts.get(str(mount))
+
+        if entry is None:
+            messages.append(
+                f"{ident}: offline; saved catalog retained"
+            )
+            continue
+
+        verified, reason = verified_partition(mount, entry, ident)
+
+        if not verified:
+            messages.append(
+                f"{ident}: identity not verified ({reason}); "
+                "saved catalog retained"
+            )
+            continue
+
+        # Inventory scanner never reads archive file contents.
+        # Any scan failure propagates; callers must not commit
+        # an incomplete replacement catalog.
+        paths = scan_files(mount)
+
+        checksum_map = dict(manifest_files or [])
+
+        inventories[ident] = [
+            (path, checksum_map.get(path))
+            for path in paths
+        ]
+
+        registered = sum(
+            checksum is not None
+            for _, checksum in inventories[ident]
+        )
+
+        messages.append(
+            f"{ident}: {len(paths)} physical files discovered; "
+            f"{registered} with SHA-256 records; "
+            f"{len(paths) - registered} without checksums"
+        )
+
+    return inventories, messages
+
 
 def backup():
     BACKUPS.mkdir(parents=True,exist_ok=True)
@@ -580,6 +1005,19 @@ def storage_overview(db, drives):
                 attention.append(
                     "SHA-256 checksum verification overdue"
                 )
+        elif sha_status == "REVIEW NEEDED":
+            attention.append(
+                "SHA-256 catalog records require review"
+            )
+        elif sha_status == "PARTIALLY REGISTERED":
+            informational.append(
+                "SHA-256 recorded for some cataloged files; "
+                "remaining files are still searchable"
+            )
+        elif sha_status == "NOT REGISTERED":
+            informational.append(
+                "File catalog available without SHA-256 checksums"
+            )
         elif sha_status == "NOT INITIALIZED":
             informational.append(
                 "SHA-256 checksum catalog not initialized"
@@ -645,6 +1083,21 @@ def drive_sha256_status(db, drive):
     ident = drive["id"]
     count = int(drive["file_count"] or 0)
 
+    # Cataloged files and SHA-256-registered files are separate.
+    registered = db.execute(
+        "SELECT COUNT(*) FROM files "
+        "WHERE drive_id=? AND sha256 IS NOT NULL AND sha256 != ''",
+        (ident,)
+    ).fetchone()[0]
+
+    unregistered = count - registered
+
+    if unregistered < 0:
+        return (
+            "REVIEW NEEDED", "warn",
+            "Catalog and checksum registration counts disagree."
+        )
+
     if count == 0:
         # A registered drive need not have a SHA-256 catalog yet.
         # Consult only saved metadata; never scan or hash the disk.
@@ -675,9 +1128,17 @@ def drive_sha256_status(db, drive):
     ).fetchone()
 
     if latest is None:
+        if registered == 0:
+            return (
+                "NOT REGISTERED", "muted",
+                f"{count:,} cataloged file(s) have no registered "
+                "SHA-256 checksums. Cataloging does not require them."
+            )
         return (
             "NOT VERIFIED", "muted",
-            "No SHA-256 verification recorded for this drive."
+            f"No SHA-256 verification recorded. "
+            f"{registered:,} file(s) have checksums; "
+            f"{unregistered:,} do not."
         )
 
     result = latest["result"]
@@ -717,7 +1178,7 @@ def drive_sha256_status(db, drive):
         )
 
     if (
-        int(latest["tracked"]) != count
+        int(latest["tracked"]) != registered
         or int(latest["delta"]) != 0
         or int(latest["issues"]) != 0
     ):
@@ -727,9 +1188,18 @@ def drive_sha256_status(db, drive):
             "PASS for the current catalog."
         )
 
+    if unregistered:
+        return (
+            "PARTIALLY REGISTERED", "muted",
+            f"The last complete SHA-256 check passed for "
+            f"{registered:,} registered file(s). "
+            f"{unregistered:,} cataloged file(s) have no "
+            "registered checksum and were not covered."
+        )
+
     return (
         "PASSED", "good",
-        f"All {count:,} cataloged files matched their saved "
+        f"All {registered:,} cataloged files matched their saved "
         "SHA-256 checksums during the last complete check."
     )
 
@@ -1056,12 +1526,53 @@ def layout(body):
             '<a href="/history">Verification history</a><a href="/commands">Commands</a></nav>'+body+
             '<footer><span>Read-only archive metadata · Catalog refresh never verifies files</span><span>Cold Storage v'+esc(APP_VERSION)+'</span></footer></main><script src="/assets/theme.js" defer></script><script src="/assets/verify-command.js" defer></script></html>')
 
+def catalog_unresolved_failures(db):
+    """Resolve file-specific failures using stored SQLite history.
+
+    No access to archive mounts or archive files.
+    """
+    failures = set()
+
+    drives = db.execute(
+        "SELECT drive_id FROM runs "
+        "UNION SELECT drive_id FROM issues"
+    ).fetchall()
+
+    for row in drives:
+        ident = row[0]
+
+        runs = db.execute(
+            "SELECT stamp,action,result,tracked,delta,issues "
+            "FROM runs WHERE drive_id=? ORDER BY seq",
+            (ident,)
+        ).fetchall()
+
+        issues = db.execute(
+            "SELECT raw FROM issues "
+            "WHERE drive_id=? ORDER BY seq",
+            (ident,)
+        ).fetchall()
+
+        failures.update(
+            unresolved_failures(
+                ident,
+                [tuple(r) for r in runs],
+                [r[0] for r in issues]
+            )
+        )
+
+    return failures
+
+
 def master_index(db, q):
     term=q.get('q',[''])[0][:300].strip()
     folder=q.get('folder',[''])[0][:2000].strip('/')
     if folder and (folder.startswith('.') or any(x in ('','.', '..') for x in folder.split('/'))):
         return '<section class="panel">Invalid folder</section>',400
-    rows=db.execute('SELECT drive_id,path FROM files ORDER BY path COLLATE NOCASE,drive_id').fetchall()
+    rows=db.execute('SELECT drive_id,path,sha256 FROM files ORDER BY path COLLATE NOCASE,drive_id').fetchall()
+    indicators=build_indicator_index(
+        rows, catalog_unresolved_failures(db)
+    )
     tree={'dirs':{},'files':[]}
     for r in rows:
         parts=r['path'].split('/')
@@ -1091,11 +1602,51 @@ def master_index(db, q):
         result='<ul class="filetree">'
         for name,child in sorted(node['dirs'].items(),key=lambda x:x[0].casefold()):
             path=(prefix+'/'+name).strip('/')
-            result+='<li>📁 <a href="'+esc(link(path))+'">'+esc(name)+'</a>'
+            summary=indicators['combined_folders'][path]
+            state=summary_status(summary)
+
+            result+=(
+                '<li>📁 <a href="'
+                +esc(link(path))
+                +'">'
+                +esc(name)
+                +'</a> '
+                +checkmark_html(state)
+            )
+
+            if summary['total']:
+                result+=(
+                    ' <span class="muted">('
+                    +str(summary['recorded'])
+                    +' of '
+                    +str(summary['total'])
+                    +' checksums recorded)</span>'
+                )
+
+            if summary['failed']:
+                result+=(
+                    ' <span class="bad">('
+                    +str(summary['failed'])
+                    +' outstanding integrity issue(s))</span>'
+                )
             if term:result+=render(child,path,depth+1)
             result+='</li>'
         for name,drive,path in sorted(node['files'],key=lambda x:(x[0].casefold(),x[1])):
-            result+='<li class="index-file">📄 <span title="'+esc(path)+'">'+esc(name)+'</span> <span class="drive-tag">'+disk_icon()+esc(drive)+'</span></li>'
+            state=indicators['files'][(drive,path)]
+
+            result+=(
+                '<li class="index-file">📄 '
+                '<span title="'
+                +esc(path)
+                +'">'
+                +esc(name)
+                +'</span> '
+                +checkmark_html(state)
+                +' <span class="drive-tag">'
+                +disk_icon()
+                +esc(drive)
+                +'</span></li>'
+            )
         return result+'</ul>'
     body+=render(tree,folder if not term else '')
     if not tree['dirs'] and not tree['files']:body+='<p>No matching files found.</p>'
@@ -1141,6 +1692,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.respond('<section class="panel">Drive not found</section>',404);return
                 if folder and (folder.startswith('.') or any(x in ('','.', '..') for x in folder.split('/'))):
                     self.respond('<section class="panel">Invalid folder</section>',400);return
+                # Calculate coverage from the complete saved catalog,
+                # independently of the current folder or search filter.
+                indicator_rows=db.execute(
+                    "SELECT drive_id,path,sha256 FROM files"
+                ).fetchall()
+                indicators=build_indicator_index(
+                    indicator_rows,
+                    catalog_unresolved_failures(db)
+                )
+
                 args=[];sql='SELECT drive_id,path FROM files WHERE 1=1'
                 if drive:sql+=' AND drive_id=?';args.append(drive)
                 # Browse a folder without a search, or show matching files with their parent directories.
@@ -1166,7 +1727,43 @@ class Handler(BaseHTTPRequestHandler):
                     for d in sorted(valid_drives):
                         count=sum(1 for r in rows if r['drive_id']==d)
                         if term and not count: continue
-                        body+='<li>'+disk_icon()+' <a href="'+esc(url(d,'',term))+'">'+esc(d)+'</a> <span class="muted">('+str(count)+' files'+(' matching' if term else '')+')</span></li>'
+                        summary=indicators['drives'].get(
+                            d, {'total':0,'recorded':0,'failed':0}
+                        )
+                        state=summary_status(summary)
+
+                        body+=(
+                            '<li>'+disk_icon()
+                            +' <a href="'
+                            +esc(url(d,'',term))
+                            +'">'
+                            +esc(d)
+                            +'</a> '
+                            +checkmark_html(state)
+                            +' <span class="muted">('
+                            +str(count)
+                            +' files'
+                            +(' matching' if term else '')
+                            +')</span>'
+                        )
+
+                        if summary['total']:
+                            body+=(
+                                ' <span class="muted">('
+                                +str(summary['recorded'])
+                                +' of '
+                                +str(summary['total'])
+                                +' checksums recorded)</span>'
+                            )
+
+                        if summary['failed']:
+                            body+=(
+                                ' <span class="bad">('
+                                +str(summary['failed'])
+                                +' outstanding integrity issue(s))</span>'
+                            )
+
+                        body+='</li>'
                     body+='</ul>'
                     if term and not rows: body+='<p>No matching files found.</p>'
                     # Do not render a drive's root folders until that drive is selected.
@@ -1184,11 +1781,55 @@ class Handler(BaseHTTPRequestHandler):
                     result='<ul class="filetree">'
                     for name, child in sorted(node['dirs'].items(),key=lambda x:x[0].casefold()):
                         path=(prefix+'/'+name).strip('/')
-                        result+='<li>📁 <a href="'+esc(url(d,path, '' if not term else term))+'">'+esc(name)+'</a>'
+                        summary=indicators['drive_folders'][
+                            (d,path)
+                        ]
+                        state=summary_status(summary)
+
+                        result+=(
+                            '<li>📁 <a href="'
+                            +esc(url(d,path, '' if not term else term))
+                            +'">'
+                            +esc(name)
+                            +'</a> '
+                            +checkmark_html(state)
+                        )
+
+                        if summary['total']:
+                            result+=(
+                                ' <span class="muted">('
+                                +str(summary['recorded'])
+                                +' of '
+                                +str(summary['total'])
+                                +' checksums recorded)</span>'
+                            )
+
+                        if summary['failed']:
+                            result+=(
+                                ' <span class="bad">('
+                                +str(summary['failed'])
+                                +' outstanding integrity issue(s))</span>'
+                            )
                         if term:result+=render(child,d,path,depth+1)
                         result+='</li>'
                     for name in sorted(node['files'],key=str.casefold):
-                        result+='<li>📄 <span title="'+esc(prefix+'/'+name)+'">'+esc(name)+'</span></li>'
+                        physical_path=(
+                            prefix+'/'+name
+                        ).strip('/')
+
+                        state=indicators['files'][
+                            (d,physical_path)
+                        ]
+
+                        result+=(
+                            '<li>📄 <span title="'
+                            +esc(physical_path)
+                            +'">'
+                            +esc(name)
+                            +'</span> '
+                            +checkmark_html(state)
+                            +'</li>'
+                        )
                     return result+'</ul>'
                 for d in sorted(tree):
                     node=tree[d]
@@ -1241,11 +1882,35 @@ class Handler(BaseHTTPRequestHandler):
                     drive_sha256_status(db, r)
                 )
 
+                registered_count = db.execute(
+                    "SELECT COUNT(*) FROM files "
+                    "WHERE drive_id=? "
+                    "AND sha256 IS NOT NULL AND sha256 != ''",
+                    (ident,)
+                ).fetchone()[0]
+
+                catalog_count = int(r["file_count"] or 0)
+                unregistered_count = max(
+                    catalog_count - registered_count, 0
+                )
+
                 body+='<div class="drive-facts">'
 
                 body+=(
                     '<div><small>Cataloged Files</small><strong>'
                     +str(r["file_count"])
+                    +'</strong></div>'
+                )
+
+                body+=(
+                    '<div><small>SHA-256 Recorded</small><strong>'
+                    +str(registered_count)
+                    +'</strong></div>'
+                )
+
+                body+=(
+                    '<div><small>No Checksum</small><strong>'
+                    +str(unregistered_count)
                     +'</strong></div>'
                 )
 
@@ -1256,14 +1921,17 @@ class Handler(BaseHTTPRequestHandler):
                     +'</strong></div>'
                 )
 
-                next_check = (
-                    due(r) if status_label == "PASSED"
-                    else (
-                        "NOT SCHEDULED"
-                        if int(r["file_count"] or 0) == 0
-                        else "VERIFY NEEDED"
-                    )
-                )
+                if status_label in (
+                    "PASSED", "PARTIALLY REGISTERED"
+                ):
+                    # A completed successful check of registered files
+                    # retains its recorded next-check date.
+                    next_check = due(r)
+                elif registered_count == 0:
+                    # Cataloging does not require SHA-256 checksums.
+                    next_check = "NOT SCHEDULED"
+                else:
+                    next_check = "VERIFY NEEDED"
                 next_check_class = (
                     "warn"
                     if next_check == "VERIFY NEEDED"
