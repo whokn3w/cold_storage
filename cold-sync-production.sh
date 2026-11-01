@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cold Storage v0.7.1 production synchronization launcher.
+# Cold Storage production synchronization launcher (interface v1).
 # Requires the exact approved application image and mounts.
 # Does not replace the original integrity engine.
 set -euo pipefail
@@ -27,7 +27,40 @@ fi
 
 container="cold_storage"
 image="ghcr.io/whokn3w/cold_storage:latest"
-release_image="ghcr.io/whokn3w/cold_storage:0.7.1"
+
+# Discover the installed version without scanning archive disks.
+# Version 0.7.1 is the sole supported legacy exception.
+release_version="$(
+  docker exec "$container" python -c '
+import app
+import re
+
+version = getattr(app, "APP_VERSION", None)
+
+if (
+    not isinstance(version, str)
+    or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version)
+):
+    raise SystemExit(1)
+
+interface = getattr(app, "SYNC_API_VERSION", None)
+
+if interface is None:
+    if version != "0.7.1":
+        raise SystemExit(1)
+elif type(interface) is not int or interface != 1:
+    raise SystemExit(1)
+
+print(version)
+'
+)" || {
+  echo "STOP: Unsupported application version or sync interface." >&2
+  exit 65
+}
+
+# Require the locally installed versioned release to match
+# both the latest image and the running production container.
+release_image="ghcr.io/whokn3w/cold_storage:${release_version}"
 approved_image_id="$(
   docker image inspect "$release_image" --format '{{.Id}}' 2>/dev/null
 )" || {
@@ -111,7 +144,15 @@ fi
 docker exec "$container_id" python -c '
 import app
 from pathlib import Path
-assert app.APP_VERSION == "0.7.1"
+assert (
+    getattr(app, "SYNC_API_VERSION", None) == 1
+    or (
+        app.APP_VERSION == "0.7.1"
+        and not hasattr(app, "SYNC_API_VERSION")
+    )
+)
+assert Path("/app/history_sync_cli.py").is_file()
+assert Path("/app/catalog_refresh_cli.py").is_file()
 assert app.DB == "/config/cold_storage.db"
 assert Path(app.DEVICES) == Path("/records/devices")
 assert Path(app.ARCHIVE_MOUNTS) == Path("/archive-mounts")

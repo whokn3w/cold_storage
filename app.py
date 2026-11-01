@@ -18,7 +18,8 @@ DB = os.getenv('DB_PATH', '/config/cold_storage.db')
 DEVICES = pathlib.Path(os.getenv('DEVICES_PATH', '/records/devices'))
 BACKUPS = pathlib.Path(os.getenv('BACKUPS_PATH', '/backups'))
 PORT = int(os.getenv('PORT', '8080'))
-APP_VERSION = '0.7.1'
+APP_VERSION = '0.7.2'
+SYNC_API_VERSION = 1
 LOCK = threading.Lock()
 UTC = datetime.timezone.utc
 LOCAL_TZ = ZoneInfo(os.environ.get("TZ", "America/Detroit"))
@@ -723,10 +724,17 @@ def due(row):
         # Schedule by the local calendar date of the successful verification.
         last_local=parse_stamp(row['last_pass']).astimezone(LOCAL_TZ)
         due_date=last_local.date()+datetime.timedelta(days=row['interval_days'] or 180)
-        return due_date.isoformat()+(' · OVERDUE' if due_date<datetime.datetime.now(LOCAL_TZ).date() else '')
+        today=datetime.datetime.now(LOCAL_TZ).date()
+        if due_date < today:
+            suffix=' · OVERDUE'
+        elif due_date == today:
+            suffix=' · DUE TODAY'
+        else:
+            suffix=''
+        return due_date.isoformat()+suffix
     except (ValueError, TypeError): return 'Unknown'
 
-CSS='''<style>body{margin:0;background:#f4f6f9;color:#17243a;font:15px system-ui,-apple-system,Segoe UI,sans-serif}header{background:#142a44;color:white;padding:23px max(22px,calc((100% - 1150px)/2))}header h1{margin:0;font-size:26px}header small{color:#b7c7d8}main{max-width:1150px;margin:28px auto;padding:0 20px}nav{display:flex;gap:12px;margin:18px 0;flex-wrap:wrap}a{color:#1766b2;text-decoration:none}nav a{background:white;padding:10px 15px;border-radius:8px;border:1px solid #dce3ed}.panel{background:white;border:1px solid #dce3ed;border-radius:12px;padding:20px;margin:18px 0;overflow:auto}h2{font-size:19px;margin:0 0 14px}.muted{color:#667589}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.metric{background:white;padding:19px;border:1px solid #dce3ed;border-radius:12px}.metric b{display:block;font-size:27px;margin-top:8px}table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:11px 10px;border-bottom:1px solid #e9edf3;vertical-align:top}th{color:#52647b}input{padding:11px;border:1px solid #bdcad9;border-radius:7px;width:min(500px,80%)}button{background:#1766b2;border:0;color:white;padding:11px 15px;border-radius:7px;cursor:pointer}code{overflow-wrap:anywhere}.warn{color:#9c5b08;font-weight:650}.bad{color:#b52d3d;font-weight:650}.good{color:#217548;font-weight:650}footer{color:#667589;margin:28px 0}.filetree{list-style:none;padding-left:24px;margin:6px 0}.filetree li{padding:5px 0;overflow-wrap:anywhere}.filetree a{font-weight:600}.driveicon{display:inline-block;width:19px;height:16px;vertical-align:-3px;margin-right:6px;color:#3476ad}.driveicon svg{width:100%;height:100%}.drive-tag{font-size:12px;color:#52647b;margin-left:8px}.index-file{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}.brand{display:flex;align-items:center;gap:14px}.brand img{width:52px;height:52px;border-radius:10px}.breadcrumb{overflow-wrap:anywhere}
+CSS='''<style>body{margin:0;background:#f4f6f9;color:#17243a;font:15px system-ui,-apple-system,Segoe UI,sans-serif}header{background:#142a44;color:white;padding:23px max(22px,calc((100% - 1150px)/2))}header h1{margin:0;font-size:26px}header small{color:#b7c7d8}main{max-width:1150px;margin:28px auto;padding:0 20px}nav{display:flex;gap:12px;margin:18px 0;flex-wrap:wrap}a{color:#1766b2;text-decoration:none}nav a{background:white;padding:10px 15px;border-radius:8px;border:1px solid #dce3ed}.panel{background:white;border:1px solid #dce3ed;border-radius:12px;padding:20px;margin:18px 0;overflow:auto}h2{font-size:19px;margin:0 0 14px}.muted{color:#667589}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.metric{background:white;padding:19px;border:1px solid #dce3ed;border-radius:12px}.metric b{display:block;font-size:27px;margin-top:8px}table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:11px 10px;border-bottom:1px solid #e9edf3;vertical-align:top}th{color:#52647b}input{padding:11px;border:1px solid #bdcad9;border-radius:7px;width:min(500px,80%)}button{background:#1766b2;border:0;color:white;padding:11px 15px;border-radius:7px;cursor:pointer}code{overflow-wrap:anywhere}.warn{color:#9c5b08;font-weight:650}.bad{color:#b52d3d;font-weight:650}.good{color:#217548;font-weight:650}footer{color:#667589;margin:28px 0}.filetree{list-style:none;padding-left:24px;margin:6px 0}.filetree li{padding:5px 0;overflow-wrap:anywhere}.filetree .checksum-check{margin-left:10px;margin-right:3px}.filetree a{font-weight:600}.driveicon{display:inline-block;width:19px;height:16px;vertical-align:-3px;margin-right:6px;color:#3476ad}.driveicon svg{width:100%;height:100%}.drive-tag{font-size:12px;color:#52647b;margin-left:8px}.index-file{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}.brand{display:flex;align-items:center;gap:14px}.brand img{width:52px;height:52px;border-radius:10px}.breadcrumb{overflow-wrap:anywhere}
 :root{color-scheme:light;--bg:#f4f6f9;--fg:#17243a;--surface:#fff;--border:#dce3ed;--subtle:#667589;--accent:#1766b2;--header:#142a44;--track:#e5eaf0;--headtext:#52647b}
 :root[data-theme="dark"]{color-scheme:dark;--bg:#111923;--fg:#e9f0f8;--surface:#1c2938;--border:#34485c;--subtle:#a8b9ca;--accent:#78b9f7;--header:#101d2b;--track:#35475a;--headtext:#bbcbdb}
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#111923;--fg:#e9f0f8;--surface:#1c2938;--border:#34485c;--subtle:#a8b9ca;--accent:#78b9f7;--header:#101d2b;--track:#35475a;--headtext:#bbcbdb}}
@@ -1524,7 +1532,7 @@ def layout(body):
             '<a href="/files">'+disk_icon()+'Archive Drives</a>'
             '<a href="/index">Master Index</a>'
             '<a href="/history">Verification history</a><a href="/commands">Commands</a></nav>'+body+
-            '<footer><span>Read-only archive metadata · Catalog refresh never verifies files</span><span>Cold Storage v'+esc(APP_VERSION)+'</span></footer></main><script src="/assets/theme.js" defer></script><script src="/assets/verify-command.js" defer></script></html>')
+            '<footer><span>Cold Storage v'+esc(APP_VERSION)+'</span></footer></main><script src="/assets/theme.js" defer></script><script src="/assets/verify-command.js" defer></script></html>')
 
 def catalog_unresolved_failures(db):
     """Resolve file-specific failures using stored SQLite history.
@@ -1936,6 +1944,7 @@ class Handler(BaseHTTPRequestHandler):
                     "warn"
                     if next_check == "VERIFY NEEDED"
                     or "OVERDUE" in next_check
+                    or "DUE TODAY" in next_check
                     else ""
                 )
 
@@ -2040,6 +2049,37 @@ class Handler(BaseHTTPRequestHandler):
                 details=json.loads(report[0]) if report else []
                 msg=f'Imported metadata from {count} registered drive(s).'
                 if details: msg+='\n'+'\n'.join(details)
+
+                unavailable = [
+                    item for item in details
+                    if isinstance(item, str)
+                    and (
+                        'offline or identity not verified; '
+                        'existing catalog retained.'
+                    ) in item
+                ]
+
+                if unavailable:
+                    body = (
+                        '<section class="panel">'
+                        '<h2>Archive drive not visible</h2>'
+                        '<p>Cold Storage cannot see the mounted '
+                        'filesystem for one or more registered '
+                        'archive drives.</p>'
+                        '<p>If the drive is already mounted in '
+                        'unRAID Unassigned Devices, restart the '
+                        '<code>cold_storage</code> Docker container, '
+                        'then select Refresh Catalog again.</p>'
+                        '<p>Saved file listings and checksum records '
+                        'for unavailable drives were preserved.</p>'
+                        '<pre style="white-space:pre-wrap">'
+                        +esc('\\n'.join(unavailable))
+                        +'</pre>'
+                        '<p><a href="/">Return to overview</a></p>'
+                        '</section>'
+                    )
+                    self.respond(body)
+                    return
             else:
                 path=backup();msg='Consistent SQLite backup created: '+str(path)
             self.respond('<section class="panel"><h2>Completed</h2><pre style="white-space:pre-wrap">'+esc(msg)+'</pre><p><a href="/">Return to overview</a></p></section>')
