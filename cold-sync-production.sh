@@ -138,5 +138,21 @@ fi
 
 # Catalog refresh needs hardware identity verification.
 # The Python CLI targets exactly the selected drive.
-exec docker exec "$container_id" \
-  python /app/catalog_refresh_cli.py "$drive"
+# Catalog mode runs in a new container so drives mounted after
+# the dashboard started are visible. Archive mounts remain
+# recursively read-only. No Docker socket or raw devices exposed.
+exec docker run --rm \
+  --network none \
+  --read-only \
+  --user 1000:1000 \
+  --cap-drop ALL \
+  --security-opt no-new-privileges \
+  --tmpfs /tmp:rw,nosuid,nodev,size=16m \
+  --mount "type=bind,source=$appdata,target=/config" \
+  --mount "type=bind,source=$records,target=/records,readonly" \
+  --mount type=bind,source=/mnt/disks,target=/archive-mounts,readonly,bind-propagation=rprivate,bind-recursive=readonly \
+  --mount type=bind,source=/dev/disk/by-id,target=/host-disk-by-id,readonly \
+  --mount type=bind,source=/sys/dev/block,target=/host-sys-dev-block,readonly \
+  --entrypoint python \
+  "$approved_image_id" \
+  /app/catalog_refresh_cli.py "$drive"
