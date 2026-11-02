@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec /bin/bash "/boot/custom/cold-storage/integrated-v070/cold-verify-sync" "$@"
