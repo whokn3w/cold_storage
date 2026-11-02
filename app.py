@@ -18,7 +18,7 @@ DB = os.getenv('DB_PATH', '/config/cold_storage.db')
 DEVICES = pathlib.Path(os.getenv('DEVICES_PATH', '/records/devices'))
 BACKUPS = pathlib.Path(os.getenv('BACKUPS_PATH', '/backups'))
 PORT = int(os.getenv('PORT', '8080'))
-APP_VERSION = '0.7.3'
+APP_VERSION = '0.7.4'
 SYNC_API_VERSION = 1
 LOCK = threading.Lock()
 UTC = datetime.timezone.utc
@@ -924,6 +924,14 @@ body{background:var(--bg);color:var(--fg)}header{background:var(--header)}a{colo
 .catalog-action-buttons form{
     margin:0;
 }
+.refresh-drive{border:1px solid var(--border);border-left:5px solid #238c9b;border-radius:10px;padding:20px;margin:18px 0;background:var(--surface)}
+.refresh-drive h3{font-size:16px;overflow-wrap:anywhere;margin:12px 0}
+.refresh-counts{display:flex;flex-wrap:wrap;gap:12px 24px}
+.refresh-counts b{font-size:22px;margin-right:4px}
+.refresh-offline,.refresh-attention{border-top:1px solid var(--border);margin-top:22px;padding-top:16px}
+.refresh-offline h3,.refresh-attention h3{font-size:16px;margin:0 0 8px}
+.refresh-offline ul,.refresh-attention ul{padding-left:20px;overflow-wrap:anywhere}
+.refresh-offline li,.refresh-attention li{margin:8px 0}
 </style>'''
 
 def drive_brand(model):
@@ -1657,6 +1665,63 @@ def master_index(db, q):
     if not tree['dirs'] and not tree['files']:body+='<p>No matching files found.</p>'
     return body+'</section>',200
 
+def render_refresh_result(count, details):
+    """Present only confirmed inventory results as refreshed drives."""
+    refreshed = {}
+    offline = set()
+    attention = []
+    lines = [item for item in details if isinstance(item, str)]
+    for item in lines:
+        match = re.fullmatch(
+            r"([A-Za-z0-9_.-]+): (\d+) physical files discovered; "
+            r"(\d+) with SHA-256 records; (\d+) without checksums", item
+        )
+        if match:
+            ident, total, checksummed, missing = match.groups()
+            refreshed[ident] = tuple(map(int, (total, checksummed, missing)))
+            continue
+        match = re.fullmatch(
+            r"([A-Za-z0-9_.-]+): offline; saved catalog retained", item
+        )
+        if match:
+            offline.add(match.group(1))
+        elif any(term in item.lower() for term in (
+            'identity not verified', 'inconsistent registration identity',
+            'unavailable', 'failed', 'error',
+        )):
+            attention.append(item)
+    body = '<section class="panel"><h2>Catalog refresh completed</h2>'
+    if refreshed:
+        for ident, (total, checksummed, missing) in refreshed.items():
+            link = '/files?' + urllib.parse.urlencode({'drive': ident})
+            body += (
+                '<article class="refresh-drive"><strong class="good">'
+                '✓ Catalog refreshed</strong><h3>'+esc(ident)+'</h3>'
+                '<div class="refresh-counts">'
+                f'<span><b>{total:,}</b> files cataloged</span>'
+                f'<span><b>{checksummed:,}</b> with checksums</span>'
+                f'<span><b>{missing:,}</b> without checksums</span></div>'
+                '<p class="muted">Physical identity verified.</p>'
+                '<a href="'+esc(link)+'">Browse files →</a></article>'
+            )
+    else:
+        body += '<p>No drive inventories were refreshed. Saved catalogs were retained.</p>'
+    if attention:
+        body += '<div class="refresh-attention"><h3 class="warn">Needs attention</h3><ul>'
+        body += ''.join('<li>'+esc(item)+'</li>' for item in dict.fromkeys(attention))
+        body += '</ul></div>'
+    offline -= refreshed.keys()
+    if offline:
+        body += '<div class="refresh-offline"><h3>Offline drives</h3><p class="muted">Saved catalogs retained.</p><ul>'
+        body += ''.join('<li>'+esc(ident)+'</li>' for ident in sorted(offline))
+        body += '</ul></div>'
+    if lines:
+        body += ('<details class="drive-tools"><summary>Refresh details</summary>'
+                 '<pre style="white-space:pre-wrap">'+esc('\n'.join(lines))+'</pre></details>')
+    body += f'<p class="muted">{count} registered drive(s) processed.</p>'
+    return body+'<p><a href="/">Return to overview</a></p></section>'
+
+
 class Handler(BaseHTTPRequestHandler):
     def asset(self,name):
         if name not in ('dashboard-icon.png','favicon-32.png','favicon-16.png','theme.js','verify-command.js'):
@@ -1683,10 +1748,10 @@ class Handler(BaseHTTPRequestHandler):
                 body=storage_overview(db,drives)
 
                 # Final section: manual catalog controls.
-                body+='<section class="panel" aria-label="Catalog maintenance"><h2>Catalog your archive</h2><p>New drive? <a href="/commands#add-drive">Register the drive first</a>, then refresh its file catalog. Generate SHA-256 checksums when you are ready; verify them separately later.</p><p class="muted">Refresh catalog lists files on mounted, identity-verified drives without hashing their contents. Files without checksums are included. Saved listings for offline drives are retained.</p><div class="catalog-action-buttons"><form method="post" action="/refresh"><button>Refresh catalog</button></form><form method="post" action="/backup"><button>Back up SQLite database to array</button></form></div></section>'
+                body+='<section class="panel" aria-label="Catalog maintenance"><div class="catalog-action-buttons"><form method="post" action="/refresh"><button>Refresh catalog</button></form><form method="post" action="/backup"><button>Back up SQLite database to array</button></form></div></section>'
                 self.respond(body);return
             if route.path=='/commands':
-                body='<section class="panel"><h2>Terminal Commands</h2><p class="muted">Commands are for use in unRAID Terminal. Selecting a command does not execute it.</p><div class="verify-command-tool" id="add-drive"><h3>1. Add a new archive drive</h3><p class="muted">Mount exactly one archive drive in Unassigned Devices. Its mount name must match the full model and serial identifier. Run this command and confirm the displayed identity.</p><div class="checksum-actions"><div class="checksum-action"><strong>Register drive identity</strong><p class="muted">Create new drive records and an empty checksum manifest. No archive files are changed or hashed. Existing drive records are never overwritten.</p><input id="add-drive-command" type="text" readonly aria-label="New archive drive registration command" value="bash /boot/custom/cold-storage/cold-add-drive.sh"></div></div></div><div class="verify-command-tool"><h3>2. Catalog files</h3><p>Return to the <a href="/">homepage</a> and select <strong>Refresh catalog</strong>. Files are cataloged even when no SHA-256 checksums exist. You can browse saved listings after disconnecting the drive.</p><p class="muted">If the mounted drive is not visible to the application, wait for any checksum or verification job and its catalog sync to finish before restarting the container and refreshing again.</p></div><div class="verify-command-tool"><h3>3. Generate checksums (optional)</h3><p class="muted checksum-intro">Select a command, copy it, and paste it into unRAID Terminal. One mounted archive drive is required.</p><div class="checksum-actions"><div class="checksum-action"><strong>Generate SHA-256 checksums</strong><p class="muted">Hash files without saved checksums, preserve existing checksums, then sync history and refresh the catalog. This establishes a baseline from the archive files as they currently exist; it does not compare them with the original source files.</p><input id="sha256-register-command" type="text" readonly aria-label="SHA-256 checksum registration command" value="cold-register-sync"></div><div class="checksum-action"><strong>4. Verify saved checksums later</strong><p class="muted">Read files again and compare them with the saved baseline. Run separately when you choose; verification does not replace the baseline.</p><input id="sha256-command" type="text" readonly aria-label="SHA-256 checksum verification command" value="cold-verify-sync"></div></div></div><div class="verify-command-tool"><h3>PAR2 Recovery</h3><p class="muted checksum-intro">Optional recovery protection. Select and copy a command for unRAID Terminal. Commands do not run from this page.</p><div class="checksum-actions"><div class="checksum-action"><strong>Manage Recovery Files</strong><p class="muted">Interactively select a drive and folder to plan or create a PAR2 baseline.</p><input id="par2-manager-command" type="text" readonly aria-label="PAR2 recovery manager command" value="bash /boot/custom/cold-storage/par2-manager.sh"></div><div class="checksum-action"><strong>Add Recovery Supplement</strong><p class="muted">Replace DRIVE_ID and FOLDER/PATH with the registered drive identifier and relative folder path.</p><input id="par2-supplement-command" type="text" readonly aria-label="PAR2 supplement creation command" value="bash /boot/custom/cold-storage/par2-supplement-create.sh DRIVE_ID &quot;FOLDER/PATH&quot;"></div><div class="checksum-action"><strong>Plan Recovery Verification</strong><p class="muted">List the existing PAR2 recovery sets without verifying file contents. Permanent launcher available after the 0.6.0 upgrade.</p><input id="par2-plan-command" type="text" readonly aria-label="PAR2 verification plan command" value="bash /boot/custom/cold-storage/par2-verify.sh plan DRIVE_ID"></div><div class="checksum-action"><strong>Verify Recovery Sets</strong><p class="muted">Verify existing recovery sets and record results. Requires confirmation and the permanent launcher installed with 0.6.0.</p><input id="par2-verify-command" type="text" readonly aria-label="PAR2 recovery verification command" value="bash /boot/custom/cold-storage/par2-verify.sh verify DRIVE_ID"></div></div></div></section>'
+                body='<section class="panel"><h2>Commands</h2><p class="muted">Mount one archive drive for setup and SHA-256 commands.</p><div class="checksum-actions"><div class="checksum-action" id="add-drive"><strong>1. Add drive</strong><p class="muted">Register a new drive without hashing files.</p><input id="add-drive-command" type="text" readonly aria-label="1. Add drive" value="bash /boot/custom/cold-storage/cold-add-drive.sh"></div><div class="checksum-action"><strong>2. Catalog files</strong><p class="muted">List files now; checksums can wait.</p><a href="/">Go to Refresh catalog →</a></div><div class="checksum-action"><strong>3. Generate checksums</strong><p class="muted">Optional. Save checksums for new files.</p><input id="sha256-register-command" type="text" readonly aria-label="3. Generate checksums" value="cold-register-sync"></div><div class="checksum-action"><strong>4. Verify checksums</strong><p class="muted">Compare files with saved checksums later.</p><input id="sha256-command" type="text" readonly aria-label="4. Verify checksums" value="cold-verify-sync"></div></div><details class="drive-tools"><summary>PAR2 recovery (optional)</summary><p class="muted">Replace DRIVE_ID and FOLDER/PATH where shown.</p><div class="checksum-actions"><div class="checksum-action"><strong>Create recovery files</strong><p class="muted">Choose a drive and folder.</p><input id="par2-manager-command" type="text" readonly aria-label="Create recovery files" value="bash /boot/custom/cold-storage/par2-manager.sh"></div><div class="checksum-action"><strong>Add recovery supplement</strong><p class="muted">Protect newly added files.</p><input id="par2-supplement-command" type="text" readonly aria-label="Add recovery supplement" value="bash /boot/custom/cold-storage/par2-supplement-create.sh DRIVE_ID &quot;FOLDER/PATH&quot;"></div><div class="checksum-action"><strong>Plan verification</strong><p class="muted">List recovery sets without checking contents.</p><input id="par2-plan-command" type="text" readonly aria-label="Plan verification" value="bash /boot/custom/cold-storage/par2-verify.sh plan DRIVE_ID"></div><div class="checksum-action"><strong>Verify recovery sets</strong><p class="muted">Check recovery sets and record results.</p><input id="par2-verify-command" type="text" readonly aria-label="Verify recovery sets" value="bash /boot/custom/cold-storage/par2-verify.sh verify DRIVE_ID"></div></div></details></section>'
                 self.respond(body);return
             if route.path=='/files':
                 term=q.get('q',[''])[0][:300].strip()
@@ -2044,22 +2109,7 @@ class Handler(BaseHTTPRequestHandler):
                 with closing(connect()) as db:
                     report=db.execute("SELECT value FROM meta WHERE key='storage_refresh_report'").fetchone()
                 details=json.loads(report[0]) if report else []
-                msg=f'Processed {count} registered drive(s); details below show which were scanned or retained.'
-                if details: msg+='\n'+'\n'.join(details)
-
-                body = (
-                    '<section class="panel"><h2>Catalog refresh completed</h2>'
-                    '<p>Accessible, identity-verified drives were scanned. '
-                    'Saved listings and checksum records for offline or '
-                    'unverified drives were retained.</p>'
-                    '<p class="muted">Disconnected archive drives are expected '
-                    'and do not make this refresh fail. If a drive you expected '
-                    'to be online was skipped, check its mount and identity. '
-                    'Restart the container only after active jobs finish if '
-                    'an already mounted drive is not visible.</p>'
-                    '<pre style="white-space:pre-wrap">'+esc(msg)+'</pre>'
-                    '<p><a href="/">Return to overview</a></p></section>'
-                )
+                body = render_refresh_result(count, details)
                 self.respond(body)
                 return
             else:
