@@ -18,7 +18,7 @@ DB = os.getenv('DB_PATH', '/config/cold_storage.db')
 DEVICES = pathlib.Path(os.getenv('DEVICES_PATH', '/records/devices'))
 BACKUPS = pathlib.Path(os.getenv('BACKUPS_PATH', '/backups'))
 PORT = int(os.getenv('PORT', '8080'))
-APP_VERSION = '0.7.4'
+APP_VERSION = '0.7.5'
 SYNC_API_VERSION = 1
 LOCK = threading.Lock()
 UTC = datetime.timezone.utc
@@ -735,7 +735,7 @@ CSS='''<style>body{margin:0;background:#f4f6f9;color:#17243a;font:15px system-ui
 :root{color-scheme:light;--bg:#f4f6f9;--fg:#17243a;--surface:#fff;--border:#dce3ed;--subtle:#667589;--accent:#1766b2;--header:#142a44;--track:#e5eaf0;--headtext:#52647b}
 :root[data-theme="dark"]{color-scheme:dark;--bg:#111923;--fg:#e9f0f8;--surface:#1c2938;--border:#34485c;--subtle:#a8b9ca;--accent:#78b9f7;--header:#101d2b;--track:#35475a;--headtext:#bbcbdb}
 @media(prefers-color-scheme:dark){:root:not([data-theme="light"]){color-scheme:dark;--bg:#111923;--fg:#e9f0f8;--surface:#1c2938;--border:#34485c;--subtle:#a8b9ca;--accent:#78b9f7;--header:#101d2b;--track:#35475a;--headtext:#bbcbdb}}
-body{background:var(--bg);color:var(--fg)}header{background:var(--header)}a{color:var(--accent)}nav a,.panel,.metric{background:var(--surface);border-color:var(--border)}.muted,footer{color:var(--subtle)}th,.drive-tag{color:var(--headtext)}th,td{border-color:var(--border)}input,select{background:var(--surface);color:var(--fg);border:1px solid var(--border)}.theme-control{margin-left:auto;display:flex;align-items:center;gap:8px;color:#dce9f7}.theme-control select{padding:7px;border-radius:7px;min-width:95px}.brand{flex-wrap:wrap}.storage-stats{margin-top:16px}.storage-card{border:1px solid var(--border);background:var(--surface);border-radius:10px;padding:16px;margin:12px 0}.storage-card h3{margin:0 0 6px;font-size:16px;overflow-wrap:anywhere}.storage-bar{height:11px;border-radius:99px;background:var(--track);overflow:hidden;margin:10px 0}.storage-fill{height:100%;background:#238c9b}.storage-meta{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}.storage-note{font-size:13px;color:var(--subtle)}.metric b{overflow-wrap:anywhere}.metric small{display:block;color:var(--subtle);margin-top:6px}footer{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}button{background:#1766b2}button:hover{filter:brightness(1.08)}
+body{background:var(--bg);color:var(--fg)}header{background:var(--header)}a{color:var(--accent)}nav a,.panel,.metric{background:var(--surface);border-color:var(--border)}.muted,footer{color:var(--subtle)}th,.drive-tag{color:var(--headtext)}th,td{border-color:var(--border)}input,select{background:var(--surface);color:var(--fg);border:1px solid var(--border)}.theme-control{margin-left:auto;display:flex;align-items:center;gap:8px;color:var(--subtle)}.theme-control select{padding:7px;border-radius:7px;min-width:95px}.brand{flex-wrap:wrap}.storage-stats{margin-top:16px}.storage-card{border:1px solid var(--border);background:var(--surface);border-radius:10px;padding:16px;margin:12px 0}.storage-card h3{margin:0 0 6px;font-size:16px;overflow-wrap:anywhere}.storage-bar{height:11px;border-radius:99px;background:var(--track);overflow:hidden;margin:10px 0}.storage-fill{height:100%;background:#238c9b}.storage-meta{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}.storage-note{font-size:13px;color:var(--subtle)}.metric b{overflow-wrap:anywhere}.metric small{display:block;color:var(--subtle);margin-top:6px}footer{display:flex;justify-content:space-between;flex-wrap:wrap;gap:12px}button{background:#1766b2}button:hover{filter:brightness(1.08)}
 
 .drive-tools{margin-top:20px;padding-top:14px;border-top:1px solid var(--border)}
 .drive-tools summary{cursor:pointer;color:var(--accent);font-weight:600;padding:8px 0}
@@ -1532,12 +1532,12 @@ def layout(body):
             'content="width=device-width,initial-scale=1"><title>Cold Storage — Offline archive catalog</title>'
             '<link rel="icon" type="image/png" href="/assets/favicon-32.png">'+CSS+
             '<header><div class="brand"><img src="/assets/dashboard-icon.png" alt="" width="52" height="52">'
-            '<div><h1>Cold Storage</h1><small>Offline archive catalog</small></div><label class="theme-control" for="theme">Theme <select id="theme" aria-label="Color theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label></div></header>'
+            '<div><h1>Cold Storage</h1><small>Offline archive catalog</small></div></div></header>'
             '<main><nav><a href="/">Overview</a>'
             '<a href="/files">'+disk_icon()+'Archive Drives</a>'
             '<a href="/index">Master Index</a>'
             '<a href="/history">Verification history</a><a href="/commands">Commands</a></nav>'+body+
-            '<footer><span>Cold Storage v'+esc(APP_VERSION)+'</span></footer></main><script src="/assets/theme.js" defer></script><script src="/assets/verify-command.js?v=catalog-first-1" defer></script></html>')
+            '<footer><span>Cold Storage v'+esc(APP_VERSION)+'</span><label class="theme-control" for="theme">Theme <select id="theme" aria-label="Color theme"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label></footer></main><script src="/assets/theme.js" defer></script><script src="/assets/verify-command.js?v=catalog-first-1" defer></script></html>')
 
 def catalog_unresolved_failures(db):
     """Resolve file-specific failures using stored SQLite history.
@@ -1810,11 +1810,6 @@ class Handler(BaseHTTPRequestHandler):
                             +esc(d)
                             +'</a> '
                             +checkmark_html(state)
-                            +' <span class="muted">('
-                            +str(count)
-                            +' files'
-                            +(' matching' if term else '')
-                            +')</span>'
                         )
 
                         if summary['total']:
