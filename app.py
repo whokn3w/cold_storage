@@ -1,3 +1,4 @@
+import hashlib, secrets
 import os, re, json, sqlite3, pathlib, datetime, threading, html, urllib.parse, shutil
 from zoneinfo import ZoneInfo
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
@@ -18,7 +19,7 @@ DB = os.getenv('DB_PATH', '/config/cold_storage.db')
 DEVICES = pathlib.Path(os.getenv('DEVICES_PATH', '/records/devices'))
 BACKUPS = pathlib.Path(os.getenv('BACKUPS_PATH', '/backups'))
 PORT = int(os.getenv('PORT', '8080'))
-APP_VERSION = '0.7.6'
+APP_VERSION = '0.7.7'
 SYNC_API_VERSION = 1
 LOCK = threading.Lock()
 UTC = datetime.timezone.utc
@@ -41,6 +42,7 @@ def init():
         CREATE TABLE IF NOT EXISTS runs (drive_id TEXT, seq INTEGER, stamp TEXT, action TEXT, result TEXT, tracked INTEGER, delta INTEGER, issues INTEGER, PRIMARY KEY(drive_id,seq));
         CREATE TABLE IF NOT EXISTS issues (drive_id TEXT, seq INTEGER, raw TEXT, PRIMARY KEY(drive_id,seq));
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY,value TEXT);
+        CREATE TABLE IF NOT EXISTS drive_tags (drive_id TEXT NOT NULL, tag TEXT NOT NULL, PRIMARY KEY(drive_id,tag));
         CREATE TABLE IF NOT EXISTS storage_snapshots (drive_id TEXT PRIMARY KEY, used_bytes INTEGER NOT NULL, available_bytes INTEGER NOT NULL, captured_at TEXT NOT NULL, FOREIGN KEY(drive_id) REFERENCES drives(id));
         ''')
         # v0.7.0: catalog entries may have no registered SHA-256.
@@ -932,6 +934,16 @@ body{background:var(--bg);color:var(--fg)}header{background:var(--header)}a{colo
 .refresh-offline h3,.refresh-attention h3{font-size:16px;margin:0 0 8px}
 .refresh-offline ul,.refresh-attention ul{padding-left:20px;overflow-wrap:anywhere}
 .refresh-offline li,.refresh-attention li{margin:8px 0}
+.drive-tag-controls{display:inline; margin-left:8px}
+.drive-category{display:inline-block;font-size:11px;line-height:1.5;padding:1px 7px;margin:2px 3px 2px 0;border:1px solid var(--border);border-radius:10px;color:var(--subtle);vertical-align:middle;overflow-wrap:anywhere}
+.tag-editor{display:inline-block;vertical-align:middle;font-size:12px;margin-left:4px}
+.tag-editor summary{cursor:pointer;color:var(--subtle)}
+.tag-editor[open]{display:block;margin:8px 0}
+.tag-editor form{margin:6px 0;max-width:480px}
+.tag-editor input[name="tags"]{box-sizing:border-box;width:min(340px,75%);padding:7px;font-size:12px}
+.tag-editor button{padding:7px 10px;font-size:12px}
+.tag-editor small{display:block;margin-top:5px}
+.tag-filter{padding:9px;max-width:160px;border-radius:7px}
 </style>'''
 
 def drive_brand(model):
@@ -1722,6 +1734,94 @@ def render_refresh_result(count, details):
     return body+'<p><a href="/">Return to overview</a></p></section>'
 
 
+# Tags belong to catalog metadata, independent of mounted disks and manifests.
+TAG_FORM_TOKEN = secrets.token_urlsafe(32)
+
+
+def normalize_drive_tags(value):
+    tags = []
+    seen = set()
+    for part in value.split(','):
+        tag = part.strip()
+        if not tag:
+            continue
+        if len(tag) > 24 or any(ord(c) < 32 or ord(c) == 127 for c in tag):
+            raise ValueError('Use tags up to 24 characters, without control characters.')
+        key = tag.casefold()
+        if key not in seen:
+            seen.add(key)
+            tags.append(tag)
+    if len(tags) > 8:
+        raise ValueError('Use at most 8 tags per drive.')
+    return sorted(tags, key=str.casefold)
+
+
+def load_drive_tags(db):
+    result = {}
+    for row in db.execute('SELECT drive_id, tag FROM drive_tags ORDER BY drive_id, tag'):
+        result.setdefault(row['drive_id'], []).append(row['tag'])
+    return {ident: sorted(tags, key=str.casefold) for ident, tags in result.items()}
+
+
+def drive_tags_revision(tags):
+    return hashlib.sha256(json.dumps(sorted(tags), ensure_ascii=True).encode()).hexdigest()
+
+
+def save_drive_tags(ident, value, revision):
+    tags = normalize_drive_tags(value)
+    with LOCK:
+        with closing(connect()) as db:
+            try:
+                db.execute('BEGIN IMMEDIATE')
+                if not db.execute('SELECT 1 FROM drives WHERE id=?', (ident,)).fetchone():
+                    raise ValueError('Drive not found. No tags changed.')
+                previous = [r[0] for r in db.execute(
+                    'SELECT tag FROM drive_tags WHERE drive_id=?', (ident,))]
+                if not secrets.compare_digest(drive_tags_revision(previous), revision):
+                    raise ValueError('Tags changed in another page. Reload Archive Drives before editing.')
+                db.execute('DELETE FROM drive_tags WHERE drive_id=?', (ident,))
+                db.executemany('INSERT INTO drive_tags(drive_id,tag) VALUES (?,?)',
+                               ((ident, tag) for tag in tags))
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+
+
+def drive_tag_controls(ident, tags):
+    result = '<span class="drive-tag-controls">'
+    for tag in tags[:3]:
+        result += '<span class="drive-category">'+esc(tag)+'</span>'
+    if len(tags) > 3:
+        result += '<span class="drive-category muted" title="'+esc(', '.join(tags[3:]))+'">+'+str(len(tags)-3)+'</span>'
+    result += (
+        '<details class="tag-editor"><summary>Edit tags</summary>'
+        '<form method="post" action="/drive-tags">'
+        '<input type="hidden" name="token" value="'+esc(TAG_FORM_TOKEN)+'">'
+        '<input type="hidden" name="drive" value="'+esc(ident)+'">'
+        '<input type="hidden" name="revision" value="'+drive_tags_revision(tags)+'">'
+        '<input name="tags" aria-label="Tags for '+esc(ident)+'" maxlength="220" '
+        'placeholder="Movies, Backups" value="'+esc(', '.join(tags))+'"> '
+        '<button>Save</button>'
+        '<small class="muted">Comma-separated · up to 8 tags · clear to remove</small>'
+        '</form></details></span>'
+    )
+    return result
+
+
+def drive_tag_filter(all_tags, selected):
+    if not all_tags and not selected:
+        return ''
+    result = ' <select class="tag-filter" name="tag" aria-label="Filter drives by tag"><option value="">All tags</option>'
+    choices = set(tag for tags in all_tags.values() for tag in tags)
+    if selected:
+        choices.add(selected)
+    for tag in sorted(choices, key=str.casefold):
+        chosen = ' selected' if tag == selected else ''
+        result += '<option value="'+esc(tag)+'"'+chosen+'>'+esc(tag)+'</option>'
+    return result+'</select>'
+
+
 class Handler(BaseHTTPRequestHandler):
     def asset(self,name):
         if name not in ('dashboard-icon.png','favicon-32.png','favicon-16.png','theme.js','verify-command.js'):
@@ -1758,6 +1858,16 @@ class Handler(BaseHTTPRequestHandler):
                 drive=q.get('drive',[''])[0][:200]
                 folder=q.get('folder',[''])[0][:2000].strip('/')
                 valid_drives={r['id'] for r in db.execute('SELECT id FROM drives')}
+                all_tags = load_drive_tags(db) if not drive else {}
+                tag_filter = q.get('tag', [''])[0][:24].strip() if not drive else ''
+                matching_drives = {
+                    ident for ident in valid_drives
+                    if not tag_filter or any(
+                        tag.casefold() == tag_filter.casefold()
+                        for tag in all_tags.get(ident, [])
+                    )
+                }
+
                 if drive and drive not in valid_drives:
                     self.respond('<section class="panel">Drive not found</section>',404);return
                 if folder and (folder.startswith('.') or any(x in ('','.', '..') for x in folder.split('/'))):
@@ -1782,9 +1892,11 @@ class Handler(BaseHTTPRequestHandler):
                     sql+=" AND path LIKE ? ESCAPE '\\'"
                     args.append(folder.replace('\\','\\\\').replace('%','\\%').replace('_','\\_')+'/%')
                 rows=db.execute(sql+' ORDER BY drive_id,path',args).fetchall()
+                if not drive and tag_filter:
+                    rows = [row for row in rows if row['drive_id'] in matching_drives]
                 def url(d='',f='',search=''):
                     return '/files?'+urllib.parse.urlencode({'drive':d,'folder':f,'q':search})
-                body='<section class="panel"><h2>Browse offline files</h2><form method="get" action="/files"><input name="q" placeholder="Search filename or folder..." value="'+esc(term)+'"><input type="hidden" name="drive" value="'+esc(drive)+'"> <button>Search</button></form>'
+                body='<section class="panel"><h2>Browse offline files</h2><form method="get" action="/files"><input name="q" placeholder="Search filename or folder..." value="'+esc(term)+'"><input type="hidden" name="drive" value="'+esc(drive)+'">'+(drive_tag_filter(all_tags, tag_filter) if not drive else '')+' <button>Search</button></form>'
                 if term:
                     body+='<p class="muted">'+str(len(rows))+' matching files. Showing folders containing those matches.</p>'
                 else:
@@ -1794,7 +1906,7 @@ class Handler(BaseHTTPRequestHandler):
                     parent='/'.join(folder.split('/')[:-1]);body+='<p><a href="'+esc(url(drive,parent))+'">← Parent folder</a> / '+esc(folder)+'</p>'
                 if not drive:
                     body+='<h3>Archive drives</h3><ul class="filetree">'
-                    for d in sorted(valid_drives):
+                    for d in sorted(matching_drives):
                         count=sum(1 for r in rows if r['drive_id']==d)
                         if term and not count: continue
                         summary=indicators['drives'].get(
@@ -1828,8 +1940,11 @@ class Handler(BaseHTTPRequestHandler):
                                 +' outstanding integrity issue(s))</span>'
                             )
 
+                        body += drive_tag_controls(d, all_tags.get(d, []))
                         body+='</li>'
                     body+='</ul>'
+                    if not matching_drives:
+                        body += '<p class="muted">No drives match this tag.</p>'
                     if term and not rows: body+='<p>No matching files found.</p>'
                     # Do not render a drive's root folders until that drive is selected.
                     self.respond(body+'</section>');return
@@ -2095,6 +2210,33 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(body+'</table></section>');return
         self.respond('<div class="panel">Page not found</div>',404)
     def do_POST(self):
+        if self.path == '/drive-tags':
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 8192:
+                    raise ValueError('Invalid tag form size.')
+                if self.headers.get('Content-Type', '').split(';')[0].strip() != 'application/x-www-form-urlencoded':
+                    raise ValueError('Invalid tag form.')
+                values = urllib.parse.parse_qs(
+                    self.rfile.read(length).decode('utf-8'),
+                    keep_blank_values=True, max_num_fields=4)
+                if set(values) != {'token', 'drive', 'tags', 'revision'} or any(len(v) != 1 for v in values.values()):
+                    raise ValueError('Invalid tag form fields.')
+                if not secrets.compare_digest(values['token'][0], TAG_FORM_TOKEN):
+                    self.respond('<section class="panel"><p>Reload Archive Drives before saving tags.</p><a href="/files">Archive Drives</a></section>', 403)
+                    return
+                save_drive_tags(values['drive'][0], values['tags'][0], values['revision'][0])
+            except (ValueError, UnicodeError) as exc:
+                self.respond('<section class="panel"><p>'+esc(exc)+'</p><a href="/files">Return to Archive Drives</a></section>', 400)
+                return
+            except Exception:
+                self.respond('<section class="panel"><p>Tags could not be saved. Please retry.</p><a href="/files">Return to Archive Drives</a></section>', 500)
+                return
+            self.send_response(303)
+            self.send_header('Location', '/files')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
         if self.path not in ('/refresh','/backup'):
             self.respond('<div class="panel">Not found</div>',404);return
         try:
