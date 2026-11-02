@@ -1,5 +1,6 @@
 (() => {
   for (const id of [
+    'add-drive-command',
     'sha256-register-command',
     'sha256-command'
   ]) {
