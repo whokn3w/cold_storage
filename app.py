@@ -19,7 +19,7 @@ DB = os.getenv('DB_PATH', '/config/cold_storage.db')
 DEVICES = pathlib.Path(os.getenv('DEVICES_PATH', '/records/devices'))
 BACKUPS = pathlib.Path(os.getenv('BACKUPS_PATH', '/backups'))
 PORT = int(os.getenv('PORT', '8080'))
-APP_VERSION = '0.7.7'
+APP_VERSION = '0.7.8'
 SYNC_API_VERSION = 1
 LOCK = threading.Lock()
 UTC = datetime.timezone.utc
@@ -291,7 +291,23 @@ def require_append_only_history(
             )
 
 
-def refresh(drive_id=None):
+class MissingFileApprovalRequired(ValueError):
+    def __init__(self, drive_id, paths):
+        self.drive_id = drive_id
+        self.paths = tuple(sorted(paths))
+        self.revision = missing_revision(drive_id, paths)
+        super().__init__("Missing unchecksummed files")
+
+
+def missing_revision(drive_id, paths):
+    data = json.dumps(
+        [drive_id, sorted(paths)],
+        separators=(',', ':')
+    )
+    return hashlib.sha256(data.encode()).hexdigest()
+
+
+def refresh(drive_id=None, approved_missing=None):
     # A targeted refresh must never inspect other archive drives.
     if drive_id is not None:
         if (
@@ -401,12 +417,36 @@ def refresh(drive_id=None):
                         ) - staged_paths
 
                         if missing:
-                            example=sorted(missing)[0]
+                            protected = sorted(
+                                path for path in missing
+                                if path in registered_paths
+                                or saved_hashes.get(path) is not None
+                            )
+                            if protected:
+                                raise ValueError(
+                                    f"{ident}: {len(protected)} missing "
+                                    "checksum-protected file(s). "
+                                    "Catalog unchanged."
+                                )
+                            revision = missing_revision(ident, missing)
+                            if approved_missing is None:
+                                raise MissingFileApprovalRequired(
+                                    ident, missing
+                                )
+                            if (
+                                drive_id != ident
+                                or not secrets.compare_digest(
+                                    approved_missing, revision
+                                )
+                            ):
+                                raise ValueError(
+                                    "Missing-file approval is stale. "
+                                    "Catalog unchanged."
+                                )
+                        elif approved_missing is not None:
                             raise ValueError(
-                                f"{ident}: {len(missing)} previously "
-                                "cataloged or registered file(s) missing "
-                                f"from the physical inventory. Example: {example}. "
-                                "Catalog unchanged; review the drive."
+                                "Physical inventory changed since approval. "
+                                "Catalog unchanged."
                             )
 
                         staged_hashes=dict(staged)
@@ -1822,6 +1862,37 @@ def drive_tag_filter(all_tags, selected):
     return result+'</select>'
 
 
+def missing_approval_page(error):
+    entries = ''.join(
+        '<li><code>' + esc(path) + '</code></li>'
+        for path in error.paths
+    )
+    return (
+        '<section class="panel">'
+        '<h2>Catalog changes require approval</h2>'
+        '<p>No changes have been made.</p>'
+        '<p>Drive: <code>' + esc(error.drive_id) + '</code></p>'
+        '<p>The following ' + str(len(error.paths)) +
+        ' unchecksummed file(s) are missing:</p>'
+        '<ul>' + entries + '</ul>'
+        '<p>Only approve if every listed file was intentionally removed. '
+        'Existing SHA-256 records and verification history are preserved.</p>'
+        '<form method="post" action="/refresh">'
+        '<input type="hidden" name="token" value="' +
+        esc(TAG_FORM_TOKEN) + '">'
+        '<input type="hidden" name="drive" value="' +
+        esc(error.drive_id) + '">'
+        '<input type="hidden" name="revision" value="' +
+        error.revision + '">'
+        '<label><input type="checkbox" name="approve" '
+        'value="yes" required style="width:auto"> '
+        'I confirm these files were intentionally removed.</label>'
+        '<p><button type="submit">Approve and Refresh Catalog</button> '
+        '<a href="/">Cancel</a></p>'
+        '</form></section>'
+    )
+
+
 class Handler(BaseHTTPRequestHandler):
     def asset(self,name):
         if name not in ('dashboard-icon.png','favicon-32.png','favicon-16.png','theme.js','verify-command.js'):
@@ -2241,7 +2312,56 @@ class Handler(BaseHTTPRequestHandler):
             self.respond('<div class="panel">Not found</div>',404);return
         try:
             if self.path=='/refresh':
-                count,errors=refresh()
+                drive = None
+                revision = None
+                length = int(
+                    self.headers.get('Content-Length', '0')
+                )
+                if length < 0 or length > 4096:
+                    raise ValueError('Invalid approval form size.')
+                if length:
+                    content_type = self.headers.get(
+                        'Content-Type', ''
+                    ).split(';')[0].strip()
+                    if content_type != 'application/x-www-form-urlencoded':
+                        raise ValueError('Invalid approval form.')
+                    values = urllib.parse.parse_qs(
+                        self.rfile.read(length).decode('utf-8'),
+                        keep_blank_values=True,
+                        max_num_fields=4
+                    )
+                    if (
+                        set(values) != {
+                            'token', 'drive', 'revision', 'approve'
+                        }
+                        or any(len(v) != 1 for v in values.values())
+                    ):
+                        raise ValueError('Invalid approval fields.')
+                    if (
+                        not secrets.compare_digest(
+                            values['token'][0], TAG_FORM_TOKEN
+                        )
+                        or values['approve'][0] != 'yes'
+                    ):
+                        raise ValueError('Approval not confirmed.')
+                    drive = values['drive'][0]
+                    revision = values['revision'][0]
+                    if (
+                        not re.fullmatch(
+                            r'[A-Za-z0-9._-]{1,256}', drive
+                        )
+                        or not re.fullmatch(
+                            r'[a-f0-9]{64}', revision
+                        )
+                    ):
+                        raise ValueError('Invalid approval details.')
+                try:
+                    count,errors=refresh(drive, revision)
+                except MissingFileApprovalRequired as approval:
+                    self.respond(
+                        missing_approval_page(approval), 409
+                    )
+                    return
                 if errors:self.respond('<section class="panel"><h2>Refresh stopped</h2><p>No catalog changes were made.</p><pre>'+esc('\n'.join(errors))+'</pre></section>',500);return
                 with closing(connect()) as db:
                     report=db.execute("SELECT value FROM meta WHERE key='storage_refresh_report'").fetchone()
