@@ -786,21 +786,28 @@ def when(value):
     except (ValueError, TypeError):
         return str(value)
 
-def due(row):
-    if not row['last_pass']: return 'Never verified'
-    try:
-        # Schedule by the local calendar date of the successful verification.
-        last_local=parse_stamp(row['last_pass']).astimezone(LOCAL_TZ)
-        due_date=last_local.date()+datetime.timedelta(days=row['interval_days'] or 180)
-        today=datetime.datetime.now(LOCAL_TZ).date()
-        if due_date < today:
-            suffix=' · OVERDUE'
-        elif due_date == today:
-            suffix=' · DUE TODAY'
-        else:
-            suffix=''
-        return due_date.isoformat()+suffix
-    except (ValueError, TypeError): return 'Unknown'
+from dashboard_attention import (
+    checksum_coverage,
+    verification_schedule,
+)
+
+
+def due(row, db):
+    """Display the next check from recorded checksum history."""
+    schedule = verification_schedule(db, row, LOCAL_TZ)
+
+    if schedule is None:
+        return "DATE UNAVAILABLE"
+
+    date_text = schedule["due_date"].isoformat()
+    remaining = schedule["days_remaining"]
+
+    if remaining < 0:
+        return date_text + " · OVERDUE"
+    if remaining == 0:
+        return date_text + " · DUE TODAY"
+    return date_text
+
 
 CSS='''<style>body{margin:0;background:#f4f6f9;color:#17243a;font:15px system-ui,-apple-system,Segoe UI,sans-serif}header{background:#142a44;color:white;padding:23px max(22px,calc((100% - 1150px)/2))}header h1{margin:0;font-size:26px}header small{color:#b7c7d8}main{max-width:1150px;margin:28px auto;padding:0 20px}nav{display:flex;gap:12px;margin:18px 0;flex-wrap:wrap}a{color:#1766b2;text-decoration:none}nav a{background:white;padding:10px 15px;border-radius:8px;border:1px solid #dce3ed}.panel{background:white;border:1px solid #dce3ed;border-radius:12px;padding:20px;margin:18px 0;overflow:auto}h2{font-size:19px;margin:0 0 14px}.muted{color:#667589}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.metric{background:white;padding:19px;border:1px solid #dce3ed;border-radius:12px}.metric b{display:block;font-size:27px;margin-top:8px}table{border-collapse:collapse;width:100%;font-size:14px}th,td{text-align:left;padding:11px 10px;border-bottom:1px solid #e9edf3;vertical-align:top}th{color:#52647b}input{padding:11px;border:1px solid #bdcad9;border-radius:7px;width:min(500px,80%)}button{background:#1766b2;border:0;color:white;padding:11px 15px;border-radius:7px;cursor:pointer}code{overflow-wrap:anywhere}.warn{color:#9c5b08;font-weight:650}.bad{color:#b52d3d;font-weight:650}.good{color:#217548;font-weight:650}footer{color:#667589;margin:28px 0}.filetree{list-style:none;padding-left:24px;margin:6px 0}.filetree li{padding:5px 0;overflow-wrap:anywhere}.filetree .checksum-check{margin-left:10px;margin-right:3px}.filetree a{font-weight:600}.driveicon{display:inline-block;width:19px;height:16px;vertical-align:-3px;margin-right:6px;color:#3476ad}.driveicon svg{width:100%;height:100%}.drive-tag{font-size:12px;color:#52647b;margin-left:8px}.index-file{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}.brand{display:flex;align-items:center;gap:14px}.brand img{width:52px;height:52px;border-radius:10px}.breadcrumb{overflow-wrap:anywhere}
 :root{color-scheme:light;--bg:#f4f6f9;--fg:#17243a;--surface:#fff;--border:#dce3ed;--subtle:#667589;--accent:#1766b2;--header:#142a44;--track:#e5eaf0;--headtext:#52647b}
@@ -1015,6 +1022,39 @@ body{background:var(--bg);color:var(--fg)}header{background:var(--header)}a{colo
 .tag-filter{padding:9px;max-width:160px;border-radius:7px}
 </style>'''
 
+CSS += """
+<style>
+/* Dashboard protection-system accents: purely decorative. */
+:root {
+    --cold-sha-accent: #138c9b;
+    --cold-par2-accent: #8565c6;
+}
+
+.drive-facts .fact-sha {
+    box-shadow: inset 3px 0 0 var(--cold-sha-accent);
+}
+
+.drive-facts .fact-par2 {
+    box-shadow: inset 3px 0 0 var(--cold-par2-accent);
+}
+
+.storage-attention .attention-item {
+    display: inline;
+    padding-inline-start: 0.45em;
+    border-inline-start: 3px solid transparent;
+}
+
+.storage-attention .attention-sha {
+    border-inline-start-color: var(--cold-sha-accent);
+}
+
+.storage-attention .attention-par2 {
+    border-inline-start-color: var(--cold-par2-accent);
+}
+</style>
+"""
+
+
 def drive_brand(model):
     """Infer manufacturer from saved model text only."""
     value = (model or "").strip().upper()
@@ -1043,6 +1083,26 @@ def human_bytes(value):
     if value>=10**12: return f'{value/10**12:,.2f} TB'
     if value>=10**9: return f'{value/10**9:,.2f} GB'
     return f'{value:,} bytes'
+
+def attention_items_html(items):
+    result = []
+
+    for message in items:
+        if message.startswith("PAR2"):
+            category = "attention-par2"
+        elif "SHA-256" in message:
+            category = "attention-sha"
+        else:
+            category = "attention-neutral"
+
+        result.append(
+            '<span class="attention-item ' + category + '">'
+            + esc(message)
+            + '</span>'
+        )
+
+    return " · ".join(result)
+
 
 def storage_overview(db, drives):
     snapshots={r['drive_id']:r for r in db.execute('SELECT * FROM storage_snapshots').fetchall()}
@@ -1092,40 +1152,52 @@ def storage_overview(db, drives):
             )
         elif sha_status == "VERIFY NEEDED":
             attention.append(
-                "SHA-256 checksum verification needed"
+                "SHA-256 catalog and verification records "
+                "require review"
             )
-        elif sha_status == "PASSED":
-            if "OVERDUE" in due(r):
-                attention.append(
-                    "SHA-256 checksum verification overdue"
-                )
         elif sha_status == "REVIEW NEEDED":
             attention.append(
                 "SHA-256 catalog records require review"
             )
-        elif sha_status == "PARTIALLY REGISTERED":
-            informational.append(
-                "SHA-256 recorded for some cataloged files; "
-                "remaining files are still searchable"
-            )
-        elif sha_status == "NOT REGISTERED":
-            informational.append(
-                "File catalog available without SHA-256 checksums"
-            )
-        elif sha_status == "NOT INITIALIZED":
-            informational.append(
-                "SHA-256 checksum catalog not initialized"
-            )
-        elif sha_status == "NOT VERIFIED":
-            informational.append(
-                "SHA-256 checksum verification not yet recorded"
+        # Checksum coverage is independent of verification
+        # results. Always display missing checksum coverage,
+        # including when another issue is present.
+        coverage = checksum_coverage(db, ident)
+
+        if coverage["unregistered"]:
+            attention.append(
+                f'{coverage["unregistered"]:,} cataloged file(s) '
+                'need SHA-256 checksums'
             )
 
-        # Highlight registrations still awaiting a complete check.
-        if r["pending"] and sha_status != "VERIFY NEEDED":
-            attention.append(
-                "New SHA-256 registrations await verification"
-            )
+        # Scheduling is informational unless the existing
+        # baseline is due or overdue. Failed and inconsistent
+        # verification records retain priority.
+        if coverage["registered"] and sha_status not in (
+            "ISSUES FOUND",
+            "INCOMPLETE",
+            "VERIFY NEEDED",
+            "REVIEW NEEDED",
+        ):
+            schedule = verification_schedule(db, r, LOCAL_TZ)
+
+            if schedule is None:
+                attention.append(
+                    "SHA-256 verification date unavailable; "
+                    "review recorded history"
+                )
+            else:
+                remaining = schedule["days_remaining"]
+
+                if remaining < 0:
+                    attention.append(
+                        f"SHA-256 verification overdue by "
+                        f"{abs(remaining):,} day(s)"
+                    )
+                elif remaining == 0:
+                    attention.append(
+                        "SHA-256 verification due today"
+                    )
 
         if par2_status == "FAILED":
             attention.append("PAR2 recovery verification FAILED")
@@ -1136,14 +1208,6 @@ def storage_overview(db, drives):
             "VERIFY NEEDED"
         ):
             attention.append("PAR2 recovery: " + par2_status)
-        elif par2_status == "COVERAGE RECORDED":
-            informational.append(
-                "PAR2 coverage recorded; verification not recorded"
-            )
-        elif par2_status == "NOT VERIFIED":
-            informational.append(
-                "PAR2 recovery verification not recorded"
-            )
 
         if attention:
             attention_class = "bad" if failure else "warn"
@@ -1151,7 +1215,7 @@ def storage_overview(db, drives):
                 '<div class="storage-attention '
                 + attention_class + '">'
                 '<strong>Attention:</strong> '
-                + esc("; ".join(attention))
+                + attention_items_html(attention + informational)
                 + '</div>'
             )
         elif informational:
@@ -1229,7 +1293,7 @@ def drive_sha256_status(db, drive):
                 "SHA-256 checksums. Cataloging does not require them."
             )
         return (
-            "NOT VERIFIED", "muted",
+            "BASELINE RECORDED", "muted",
             f"No SHA-256 verification recorded. "
             f"{registered:,} file(s) have checksums; "
             f"{unregistered:,} do not."
@@ -1249,8 +1313,9 @@ def drive_sha256_status(db, drive):
             "Review the recorded operations and issues."
         )
 
-    # A successful registration after verification invalidates
-    # the previous PASS for the current catalog.
+    # Additional successful registrations extend the checksum
+    # baseline. They do not automatically require immediate
+    # verification or erase the previous successful check.
     latest_addition = db.execute(
         "SELECT seq FROM runs "
         "WHERE drive_id=? AND action='register' "
@@ -1260,15 +1325,14 @@ def drive_sha256_status(db, drive):
     ).fetchone()
 
     if (
-        drive["pending"]
-        or (
-            latest_addition is not None
-            and latest_addition["seq"] > latest["seq"]
-        )
+        latest_addition is not None
+        and latest_addition["seq"] > latest["seq"]
     ):
         return (
-            "VERIFY NEEDED", "warn",
-            "New SHA-256 registrations are awaiting verification."
+            "BASELINE UPDATED", "muted",
+            "Additional SHA-256 checksums were recorded after "
+            "the last successful full verification. The previous "
+            "PASS does not cover those newer registrations."
         )
 
     if (
@@ -2183,45 +2247,46 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 body+=(
-                    '<div><small>SHA-256 Recorded</small><strong>'
+                    '<div class="fact-sha"><small>SHA-256 Recorded</small><strong>'
                     +str(registered_count)
                     +'</strong></div>'
                 )
 
                 body+=(
-                    '<div><small>No Checksum</small><strong>'
+                    '<div class="fact-sha"><small>No Checksum</small><strong>'
                     +str(unregistered_count)
                     +'</strong></div>'
                 )
 
                 body+=(
-                    '<div><small>SHA-256 Checksum Verification</small>'
+                    '<div class="fact-sha"><small>SHA-256 Checksum Verification</small>'
                     '<strong class="'+status_class+'">'
                     +esc(status_label)
                     +'</strong></div>'
                 )
 
-                if status_label in (
-                    "PASSED", "PARTIALLY REGISTERED"
-                ):
-                    # A completed successful check of registered files
-                    # retains its recorded next-check date.
-                    next_check = due(r)
-                elif registered_count == 0:
-                    # Cataloging does not require SHA-256 checksums.
+                if registered_count == 0:
                     next_check = "NOT SCHEDULED"
+                elif status_label in (
+                    "ISSUES FOUND",
+                    "INCOMPLETE",
+                    "REVIEW NEEDED",
+                    "VERIFY NEEDED",
+                ):
+                    next_check = "REVIEW ISSUES"
                 else:
-                    next_check = "VERIFY NEEDED"
+                    next_check = due(r, db)
+
                 next_check_class = (
                     "warn"
-                    if next_check == "VERIFY NEEDED"
+                    if next_check in ("VERIFY NEEDED", "REVIEW ISSUES")
                     or "OVERDUE" in next_check
                     or "DUE TODAY" in next_check
                     else ""
                 )
 
                 body+=(
-                    '<div><small>Next SHA-256 Check</small>'
+                    '<div class="fact-sha"><small>Next SHA-256 Check</small>'
                     '<strong class="'+next_check_class+'">'
                     +esc(next_check)+'</strong></div>'
                 )
@@ -2231,7 +2296,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
 
                 body+=(
-                    '<div><small>PAR2 Recovery</small>'
+                    '<div class="fact-par2"><small>PAR2 Recovery</small>'
                     '<strong class="'+par2_class+'">'
                     +esc(par2_label)
                     +'</strong></div>'
