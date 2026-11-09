@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from contextlib import closing
 from inventory import scan_files
+from retirement_approval import authorized_retirements
 from failure_records import (
     unresolved_failures,
     normalize_issue_path,
@@ -19,7 +20,7 @@ DB = os.getenv('DB_PATH', '/config/cold_storage.db')
 DEVICES = pathlib.Path(os.getenv('DEVICES_PATH', '/records/devices'))
 BACKUPS = pathlib.Path(os.getenv('BACKUPS_PATH', '/backups'))
 PORT = int(os.getenv('PORT', '8080'))
-APP_VERSION = '0.7.8'
+APP_VERSION = '0.7.9'
 SYNC_API_VERSION = 1
 LOCK = threading.Lock()
 UTC = datetime.timezone.utc
@@ -416,33 +417,60 @@ def refresh(drive_id=None, approved_missing=None):
                             previous_paths | registered_paths
                         ) - staged_paths
 
+                        authorized = set()
+
                         if missing:
-                            protected = sorted(
+                            protected = {
                                 path for path in missing
                                 if path in registered_paths
                                 or saved_hashes.get(path) is not None
-                            )
+                            }
+
                             if protected:
+                                authorized = authorized_retirements(
+                                    DEVICES / ident,
+                                    ident,
+                                    saved_hashes,
+                                    staged_paths,
+                                    parse_manifest
+                                )
+
+                                if authorized != protected:
+                                    raise ValueError(
+                                        f"{ident}: missing SHA-protected "
+                                        "files lack matching retirement "
+                                        "approval. Catalog unchanged."
+                                    )
+
+                            unapproved = missing - authorized
+
+                            if unapproved:
+                                revision = missing_revision(
+                                    ident, unapproved
+                                )
+
+                                if approved_missing is None:
+                                    raise MissingFileApprovalRequired(
+                                        ident, unapproved
+                                    )
+
+                                if (
+                                    drive_id != ident
+                                    or not secrets.compare_digest(
+                                        approved_missing, revision
+                                    )
+                                ):
+                                    raise ValueError(
+                                        "Missing-file approval is stale. "
+                                        "Catalog unchanged."
+                                    )
+
+                            elif approved_missing is not None:
                                 raise ValueError(
-                                    f"{ident}: {len(protected)} missing "
-                                    "checksum-protected file(s). "
+                                    "Unexpected missing-file approval. "
                                     "Catalog unchanged."
                                 )
-                            revision = missing_revision(ident, missing)
-                            if approved_missing is None:
-                                raise MissingFileApprovalRequired(
-                                    ident, missing
-                                )
-                            if (
-                                drive_id != ident
-                                or not secrets.compare_digest(
-                                    approved_missing, revision
-                                )
-                            ):
-                                raise ValueError(
-                                    "Missing-file approval is stale. "
-                                    "Catalog unchanged."
-                                )
+
                         elif approved_missing is not None:
                             raise ValueError(
                                 "Physical inventory changed since approval. "
@@ -459,10 +487,11 @@ def refresh(drive_id=None, approved_missing=None):
                                 if checksum is not None
                                 and staged_hashes.get(path) is None
                             ]
-                            if lost:
+                            if lost and set(lost) != authorized:
                                 raise ValueError(
                                     f"{ident}: {len(lost)} saved checksum "
-                                    "record(s) absent from the manifest; "
+                                    "record(s) absent from the manifest "
+                                    "without matching retirement approval; "
                                     "catalog unchanged."
                                 )
 

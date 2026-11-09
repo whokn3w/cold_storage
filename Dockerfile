@@ -11,6 +11,7 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY app.py /app/app.py
+COPY retirement_approval.py /app/retirement_approval.py
 COPY inventory.py /app/inventory.py
 COPY indicators.py /app/indicators.py
 COPY failure_records.py /app/failure_records.py
