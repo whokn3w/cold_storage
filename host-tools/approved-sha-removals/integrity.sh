@@ -96,11 +96,122 @@ STAGED=''
 RESCAN=''
 RECEIPT_TMP=''
 COMPLETED=0
+# BEGIN VERIFY PROGRESS REPORTING
+PROGRESS_ACTIVE=0
+PROGRESS_TMP=''
+PROGRESS_FILE="$DIR/verification_logs/verify_progress.json"
+PROGRESS_RUN_ID="${STAMP}-$$"
+PROGRESS_TOTAL=0
+PROCESSED=0
+PROGRESS_LAST_SECOND=$SECONDS
+PROGRESS_WARNED=0
+
+publish_verify_progress() {
+  local phase="$1" updated tmp
+  (( PROGRESS_ACTIVE == 1 )) || return 0
+  case "$phase" in running|finished|interrupted) ;; *) return 1 ;; esac
+  [[ -d "$DIR/verification_logs" && ! -L "$DIR/verification_logs" ]] || return 1
+  [[ ! -L "$PROGRESS_FILE" ]] || return 1
+  [[ ! -e "$PROGRESS_FILE" || -f "$PROGRESS_FILE" ]] || return 1
+
+  updated="$(date -u +%Y-%m-%dT%H:%M:%SZ)" || return 1
+  tmp="$(mktemp "$DIR/verification_logs/.verify_progress.XXXXXXXX")" || return 1
+  PROGRESS_TMP="$tmp"
+
+  if ! printf '{"schema":1,"run_id":"%s","started_at":"%s","updated_at":"%s","phase":"%s","total":%d,"processed":%d,"hashed":%d,"issues":%d,"unregistered":%d}\n' \
+      "$PROGRESS_RUN_ID" "$STAMP" "$updated" "$phase" \
+      "$PROGRESS_TOTAL" "$PROCESSED" "$CHECKED" "$PROBLEMS" "$UNTRACKED" > "$tmp"; then
+    rm -f -- "$tmp" || true
+    PROGRESS_TMP=''
+    return 1
+  fi
+
+  if ! chmod 644 -- "$tmp" || ! mv -fT -- "$tmp" "$PROGRESS_FILE"; then
+    rm -f -- "$tmp" || true
+    PROGRESS_TMP=''
+    return 1
+  fi
+
+  PROGRESS_TMP=''
+}
+
+report_verify_progress() {
+  if ! publish_verify_progress "$1"; then
+    if (( PROGRESS_WARNED == 0 )); then
+      printf 'WARNING: Unable to publish optional SHA-256 progress metadata.\n' >&2
+      PROGRESS_WARNED=1
+    fi
+  fi
+  return 0
+}
+# Hashing a large file can exceed the dashboard freshness window.
+# This auxiliary worker refreshes only the timestamp and the existing
+# counters; it does not inspect or modify the archive file.
+# It runs in the SHA command-substitution process and stops before
+# that process returns its checksum to the main verification loop.
+
+PROGRESS_HEARTBEAT_SECONDS=20
+PROGRESS_HEARTBEAT_MIN_BYTES=67108864
+
+hash_with_verify_heartbeat() {
+  local file="$1"
+  local bytes='' rc=0 watcher='' owner_pid='' main_pid=''
+
+  # If stat fails, continue the original hashing operation without
+  # optional heartbeat support. Never alter its SHA-256 result.
+  if bytes="$(stat -c %s -- "$file" 2>/dev/null)" &&
+     [[ "$bytes" =~ ^[0-9]+$ ]] &&
+     (( bytes >= PROGRESS_HEARTBEAT_MIN_BYTES )); then
+
+    owner_pid="$BASHPID"
+    main_pid="$$"
+
+    (
+      # Remove a partially staged metadata file if this worker exits.
+      trap '[[ -z "$PROGRESS_TMP" ]] || rm -f -- "$PROGRESS_TMP"' EXIT
+
+      while sleep "$PROGRESS_HEARTBEAT_SECONDS"; do
+        # A dead verification process must not leave a heartbeat
+        # publishing apparently active progress indefinitely.
+        kill -0 "$owner_pid" 2>/dev/null || exit 0
+        kill -0 "$main_pid" 2>/dev/null || exit 0
+
+        # Counts remain unchanged throughout this individual hash.
+        report_verify_progress running
+      done
+    ) </dev/null >/dev/null 2>&1 &
+
+    watcher=$!
+  fi
+
+  # Preserve the original sha256sum command and its exit code.
+  # In particular, a read error must remain a read error.
+  if sha256sum -- "$file"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  # Stop and reap the heartbeat BEFORE the caller records a new
+  # processed count, issue, or terminal verification state.
+  if [[ -n "$watcher" ]]; then
+    kill "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+  fi
+
+  return "$rc"
+}
+
+# END VERIFY PROGRESS REPORTING
 cleanup() {
   local rc=$?
   if (( COMPLETED == 0 )) && [[ "$MODE" != retire-preview && "$MODE" != retire ]]; then
     printf '%s\t%s\tINCOMPLETE\t%s\t0\t-1\n' "$STAMP" "$MODE" "${#KNOWN[@]}" >> "$RUNS" || true
   fi
+  if (( COMPLETED == 0 && PROGRESS_ACTIVE == 1 )); then
+    report_verify_progress interrupted
+  fi
+  [[ -z "$PROGRESS_TMP" ]] || rm -f -- "$PROGRESS_TMP"
   rm -f -- "$ALL_LIST" "$NEW_LIST"
   [[ -z "$STAGED" ]] || rm -f -- "$STAGED"
   [[ -z "$RESCAN" ]] || rm -f -- "$RESCAN"
@@ -445,20 +556,39 @@ fi
 PROBLEMS=0
 UNTRACKED=0
 CHECKED=0
+PROCESSED=0
+PROGRESS_TOTAL="${#KNOWN[@]}"
 while IFS= read -r -d '' path; do
   if [[ ! -v KNOWN["$path"] ]]; then issue UNREGISTERED "$path"; ((PROBLEMS+=1)); ((UNTRACKED+=1)); fi
 done < "$ALL_LIST"
+PROGRESS_ACTIVE=1
+report_verify_progress running
 for path in "${!KNOWN[@]}"; do
   FILE="$MOUNT/${path#./}"
-  if [[ ! -f "$FILE" || -L "$FILE" ]]; then issue MISSING "$path"; ((PROBLEMS+=1)); continue; fi
-  if ! ACTUAL="$(sha256sum -- "$FILE")"; then issue READ_ERROR "$path"; ((PROBLEMS+=1)); continue; fi
-  ACTUAL="${ACTUAL:0:64}"
-  if [[ "$ACTUAL" != "${KNOWN[$path]}" ]]; then issue HASH_MISMATCH "$path"; ((PROBLEMS+=1)); fi
-  ((CHECKED+=1))
+  if [[ ! -f "$FILE" || -L "$FILE" ]]; then
+    issue MISSING "$path"
+    ((PROBLEMS+=1))
+  elif ! ACTUAL="$(hash_with_verify_heartbeat "$FILE")"; then
+    issue READ_ERROR "$path"
+    ((PROBLEMS+=1))
+  else
+    ACTUAL="${ACTUAL:0:64}"
+    if [[ "$ACTUAL" != "${KNOWN[$path]}" ]]; then
+      issue HASH_MISMATCH "$path"
+      ((PROBLEMS+=1))
+    fi
+    ((CHECKED+=1))
+  fi
+  ((PROCESSED+=1))
+  if (( PROCESSED == PROGRESS_TOTAL || SECONDS > PROGRESS_LAST_SECOND )); then
+    report_verify_progress running
+    PROGRESS_LAST_SECOND=$SECONDS
+  fi
 done
 if (( PROBLEMS == 0 )); then RESULT=PASS; else RESULT=FAIL; fi
 record_run verify "$RESULT" "${#KNOWN[@]}" "$UNTRACKED" "$PROBLEMS"
 COMPLETED=1
+report_verify_progress finished
 printf '\nVERIFY RESULT: %s | checked: %d | tracked: %d | unregistered: %d | issues: %d\n' "$RESULT" "$CHECKED" "${#KNOWN[@]}" "$UNTRACKED" "$PROBLEMS"
 printf 'Logs: %s\n' "$DIR/verification_logs"
 [[ "$RESULT" == PASS ]]

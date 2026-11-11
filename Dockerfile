@@ -12,6 +12,9 @@ WORKDIR /app
 
 COPY app.py /app/app.py
 COPY dashboard_attention.py /app/dashboard_attention.py
+COPY verification_history.py /app/verification_history.py
+COPY verification_progress.py /app/verification_progress.py
+COPY verification_progress_view.py /app/verification_progress_view.py
 COPY retirement_approval.py /app/retirement_approval.py
 COPY inventory.py /app/inventory.py
 COPY indicators.py /app/indicators.py

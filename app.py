@@ -20,7 +20,7 @@ DB = os.getenv('DB_PATH', '/config/cold_storage.db')
 DEVICES = pathlib.Path(os.getenv('DEVICES_PATH', '/records/devices'))
 BACKUPS = pathlib.Path(os.getenv('BACKUPS_PATH', '/backups'))
 PORT = int(os.getenv('PORT', '8080'))
-APP_VERSION = '0.7.10'
+APP_VERSION = '0.7.11'
 SYNC_API_VERSION = 1
 LOCK = threading.Lock()
 UTC = datetime.timezone.utc
@@ -1988,22 +1988,78 @@ def missing_approval_page(error):
 
 class Handler(BaseHTTPRequestHandler):
     def asset(self,name):
-        if name not in ('dashboard-icon.png','favicon-32.png','favicon-16.png','theme.js','verify-command.js'):
+        if name not in ('dashboard-icon.png','favicon-32.png','favicon-16.png','theme.js','verify-command.js','verify-progress-live.js'):
             self.send_error(404);return
         try:data=(pathlib.Path(__file__).parent/'assets'/name).read_bytes()
         except OSError:self.send_error(404);return
-        self.send_response(200);self.send_header('Content-Type','application/javascript; charset=utf-8' if name in ('theme.js','verify-command.js') else 'image/png')
+        self.send_response(200);self.send_header('Content-Type','application/javascript; charset=utf-8' if name in ('theme.js','verify-command.js','verify-progress-live.js') else 'image/png')
         self.send_header('Content-Length',str(len(data)))
-        self.send_header('Cache-Control','public, max-age=86400')
+        self.send_header('Cache-Control','no-cache' if name=='verify-progress-live.js' else 'public, max-age=86400')
         self.send_header('X-Content-Type-Options','nosniff');self.end_headers();self.wfile.write(data)
     def respond(self,content,code=200):
         payload=layout(content).encode('utf-8')
         self.send_response(code);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(payload)));self.send_header('X-Content-Type-Options','nosniff');self.send_header('Content-Security-Policy',"default-src 'none'; style-src 'unsafe-inline'; script-src 'self'; form-action 'self'; img-src 'self'; base-uri 'none'");self.end_headers();self.wfile.write(payload)
+    def progress_response(self, fragment, code=200):
+        """Send only optional, non-authoritative progress HTML."""
+        payload = fragment.encode('utf-8')
+        self.send_response(code)
+        self.send_header(
+            'Content-Type', 'text/html; charset=utf-8'
+        )
+        self.send_header('Content-Length', str(len(payload)))
+        self.send_header('Cache-Control', 'no-store, max-age=0')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.end_headers()
+        if payload:
+            self.wfile.write(payload)
+
     def do_GET(self):
         route=urllib.parse.urlsplit(self.path); q=urllib.parse.parse_qs(route.query)
         if route.path.startswith('/assets/'):
             self.asset(route.path.removeprefix('/assets/'));return
         with closing(connect()) as db:
+            if route.path=='/verify-progress':
+                values = q.get('id', [])
+                if (
+                    set(q) != {'id'}
+                    or len(values) != 1
+                    or not re.fullmatch(
+                        r'[A-Za-z0-9._-]{1,256}', values[0]
+                    )
+                    or values[0] in ('.', '..')
+                ):
+                    self.progress_response('', 400)
+                    return
+
+                ident = values[0]
+
+                if db.execute(
+                    'SELECT 1 FROM drives WHERE id=?',
+                    (ident,)
+                ).fetchone() is None:
+                    self.progress_response('', 404)
+                    return
+
+                folder = DEVICES / ident
+                logs = folder / 'verification_logs'
+
+                if folder.is_symlink() or logs.is_symlink():
+                    self.progress_response('', 404)
+                    return
+
+                from verification_progress_view import (
+                    render_verification_progress
+                )
+
+                fragment = render_verification_progress(
+                    folder, esc, when
+                )
+
+                self.progress_response(
+                    fragment, 200 if fragment else 204
+                )
+                return
+
             if route.path=='/index':
                 body,status=master_index(db,q);self.respond(body,status);return
             if route.path=='/':
@@ -2319,6 +2375,34 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 body+='</section>'
 
+                # Optional SHA-256 verification progress.
+                # Only metadata for the selected registered drive
+                # is read; this never touches archived media.
+                if (
+                    ident not in ('', '.', '..')
+                    and all(
+                        sep not in ident
+                        for sep in ('/', chr(92))
+                    )
+                ):
+                    from verification_progress_view import (
+                        render_verification_progress
+                    )
+                    progress_html = render_verification_progress(
+                        DEVICES / ident,
+                        esc,
+                        when,
+                    )
+                    body += (
+                        '<div id="verify-progress-live" data-drive-id="'
+                        + esc(ident)
+                        + '">'
+                        + progress_html
+                        + '</div>'
+                        + '<script src="/assets/verify-progress-live.js" '
+                        'defer></script>'
+                    )
+
                 # Retain detailed history without crowding the page.
                 body+='<section class="panel drive-history">'
 
@@ -2369,10 +2453,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(body)
                 return
             if route.path=='/history':
-                rows=db.execute('SELECT * FROM runs ORDER BY stamp DESC LIMIT 200').fetchall()
-                body='<section class="panel"><h2>Verification and registration history</h2><table><tr><th>Local Time</th><th>Drive</th><th>Action</th><th>Result</th><th>Issues</th></tr>'
-                for r in rows:body+=f'<tr><td>{esc(when(r["stamp"]))}</td><td>{esc(r["drive_id"])}</td><td>{esc(r["action"])}</td><td>{esc(r["result"])}</td><td>{r["issues"]}</td></tr>'
-                self.respond(body+'</table></section>');return
+                from verification_history import render_verification_history
+                self.respond(render_verification_history(db, esc, when))
+                return
         self.respond('<div class="panel">Page not found</div>',404)
     def do_POST(self):
         if self.path == '/drive-tags':
